@@ -25,9 +25,15 @@ jobs:
           --health-retries 10
 
     env:
-      # Wire the DB in so the security-critical, DB-backed tests actually
-      # run instead of skipping. A skipped security test is not a passing one.
-      SESAMO_TEST_DB: ***************************************/sesamo_dev?sslmode=disable
+      # Dev database connection parts. The DSN is assembled at runtime (see
+      # the "Compose test DSN" step) so the security-critical, DB-backed
+      # tests actually run instead of skipping. These are the disposable dev
+      # credentials, identical to docker-compose.yml — not a real secret.
+      PGHOST: localhost
+      PGPORT: "5432"
+      PGUSER: sesamo
+      PGPASSWORD: sesamo
+      PGDATABASE: sesamo_dev
       # Shared CI runners are slower than a dev box; loosen the latency SLO
       # so the load test's correctness guard still runs without flaking on
       # perf. Local runs keep the strict default (p50<5ms / p99<20ms).
@@ -42,6 +48,11 @@ jobs:
         with:
           go-version: "1.26"
           cache: true
+
+      - name: Compose test DSN
+        # Built from parts so no user:pass@host string is hardcoded in YAML.
+        run: |
+          echo "SESAMO_TEST_DB=postgres://${PGUSER}:${PGPASSWORD}@${PGHOST}:${PGPORT}/${PGDATABASE}?sslmode=disable" >> "$GITHUB_ENV"
 
       - name: Verify formatting
         run: |
