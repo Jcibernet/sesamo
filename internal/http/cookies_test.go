@@ -1,47 +1,19 @@
 package http
 
 import (
-	"context"
 	"net/http"
 	"net/http/cookiejar"
-	"net/http/httptest"
 	"net/url"
-	"os"
 	"strings"
 	"testing"
-	"time"
-
-	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/jcibernet/sesamo/internal/config"
 )
 
 func newHarnessWithDomain(t *testing.T, cookieDomain string) *harness {
-	t.Helper()
-	dsn := os.Getenv("SESAMO_TEST_DB")
-	if dsn == "" {
-		t.Skip("SESAMO_TEST_DB not set; skipping integration test")
-	}
-	pool, err := pgxpool.New(context.Background(), dsn)
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	cfg := &config.Config{
-		BaseURL:                 "http://127.0.0.1",
-		CookieName:              "sid",
-		CookieSecure:            false,
-		CookieDomain:            cookieDomain,
-		SessionLifetime:         30 * 24 * time.Hour,
-		RollingRenewalThreshold: 15 * time.Minute,
-		ServiceToken:            "svc-token-test",
-		AdminAPIKey:             "admin-key-test",
-		EmailProvider:           "log",
-		EmailFrom:               "auth@test.local",
-	}
-	h := NewServer(cfg, pool, testLogger())
-	srv := httptest.NewServer(h)
-	t.Cleanup(func() { srv.Close(); pool.Close() })
-	return &harness{srv: srv, pool: pool, t: t}
+	return newHarnessWithConfig(t, func(cfg *config.Config) {
+		cfg.CookieDomain = cookieDomain
+	})
 }
 
 func TestCookieDomainAttr(t *testing.T) {
@@ -110,4 +82,50 @@ func TestCookieDomainAttr(t *testing.T) {
 		}
 		t.Fatal("sid cookie not found in Set-Cookie headers")
 	})
+}
+
+// TestSessionCookieSecurityFlags asserts the actual security properties of
+// the session cookie: HttpOnly (no JS access), SameSite=Lax (CSRF defense),
+// and Secure when CookieSecure is enabled (production). Only the Domain
+// attribute was covered before; a regression flipping any of these flags
+// would previously go undetected.
+func TestSessionCookieSecurityFlags(t *testing.T) {
+	h := newHarnessWithConfig(t, func(cfg *config.Config) {
+		cfg.CookieSecure = true // production posture
+	})
+	email := uniqueEmail("cookieflags")
+	h.signup(email, "correct-horse-3")
+
+	jar, _ := cookiejar.New(nil)
+	c := &http.Client{
+		Jar: jar,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	req, _ := http.NewRequest(http.MethodPost, h.srv.URL+"/login",
+		strings.NewReader(url.Values{"email": {email}, "password": {"correct-horse-3"}}.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	res, err := c.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+
+	for _, ck := range res.Cookies() {
+		if ck.Name != "sid" {
+			continue
+		}
+		if !ck.HttpOnly {
+			t.Error("session cookie must be HttpOnly")
+		}
+		if !ck.Secure {
+			t.Error("session cookie must be Secure when CookieSecure=true")
+		}
+		if ck.SameSite != http.SameSiteLaxMode {
+			t.Errorf("session cookie SameSite=%d, want Lax(%d)", ck.SameSite, http.SameSiteLaxMode)
+		}
+		return
+	}
+	t.Fatal("sid cookie not found in Set-Cookie headers")
 }
