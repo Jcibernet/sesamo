@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: sesamo
+          POSTGRES_PASSWORD: sesamo
+          POSTGRES_DB: sesamo_dev
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U sesamo -d sesamo_dev"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # Wire the DB in so the security-critical, DB-backed tests actually
+      # run instead of skipping. A skipped security test is not a passing one.
+      SESAMO_TEST_DB: ***************************************/sesamo_dev?sslmode=disable
+      # Shared CI runners are slower than a dev box; loosen the latency SLO
+      # so the load test's correctness guard still runs without flaking on
+      # perf. Local runs keep the strict default (p50<5ms / p99<20ms).
+      SESAMO_LOAD_P50_MAX_MS: "50"
+      SESAMO_LOAD_P99_MAX_MS: "200"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Verify formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-clean:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Apply migrations
+        run: |
+          go build -o sesamo ./cmd/sesamo
+          SESAMO_DATABASE_URL="$SESAMO_TEST_DB" ./sesamo migrate
+
+      - name: Test (with database)
+        # -count=1 disables the test cache so DB-backed tests always execute.
+        # The whole point of the Postgres service above is that nothing skips
+        # for want of a database, so a SKIP is treated as a red build.
+        run: |
+          set -o pipefail
+          go test -count=1 -v ./... 2>&1 | tee test.out
+          if grep -q -- '--- SKIP' test.out; then
+            echo "::error::Some tests were skipped; the DB-backed suite must run in full."
+            grep -- '--- SKIP' test.out
+            exit 1
+          fi

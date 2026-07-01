@@ -27,6 +27,12 @@ type harness struct {
 }
 
 func newHarness(t *testing.T) *harness {
+	return newHarnessWithConfig(t, nil)
+}
+
+// newHarnessWithConfig boots the real handler against the dev DB, applying
+// an optional mutation to the base test config before building the server.
+func newHarnessWithConfig(t *testing.T, mutate func(*config.Config)) *harness {
 	t.Helper()
 	dsn := os.Getenv("SESAMO_TEST_DB")
 	if dsn == "" {
@@ -46,6 +52,9 @@ func newHarness(t *testing.T) *harness {
 		AdminAPIKey:             "admin-key-test",
 		EmailProvider:           "log",
 		EmailFrom:               "auth@test.local",
+	}
+	if mutate != nil {
+		mutate(cfg)
 	}
 	h := NewServer(cfg, pool, testLogger())
 	srv := httptest.NewServer(h)
@@ -247,9 +256,20 @@ func TestThreat08_ResetRevokesAllSessions(t *testing.T) {
 
 // ── Threat vector 9: OAuth callback rejects state mismatch (CSRF) ─────
 func TestThreat09_OAuthStateMismatchRejected(t *testing.T) {
-	h := newHarness(t)
+	// Register a real Google provider so the callback reaches the state
+	// check instead of short-circuiting on "provider not found" (404).
+	// The CSRF/state check runs before any network call to Google, so
+	// dummy credentials are enough to exercise the security-relevant path.
+	h := newHarnessWithConfig(t, func(cfg *config.Config) {
+		cfg.Google = config.OAuthProviderConfig{
+			ClientID:     "test-client-id",
+			ClientSecret: "test-client-secret",
+			RedirectURI:  "http://127.0.0.1/auth/google/callback",
+		}
+	})
 	c := h.client()
-	// No state cookie set; provider returns some state => must reject.
+	// No state cookie set; provider returns some state => must reject
+	// with a specific state_mismatch (400), NOT a generic 404.
 	req, _ := http.NewRequest(http.MethodGet,
 		h.srv.URL+"/auth/google/callback?code=abc&state=attacker", nil)
 	req.Header.Set("Accept", "application/json")
@@ -257,11 +277,13 @@ func TestThreat09_OAuthStateMismatchRejected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer res.Body.Close()
-	// google provider isn't configured in the harness => 404, which also
-	// safely refuses. If configured, it would be 400 state_mismatch.
-	if res.StatusCode != http.StatusBadRequest && res.StatusCode != http.StatusNotFound {
-		t.Fatalf("state mismatch should not authenticate: %d", res.StatusCode)
+	body, _ := io.ReadAll(res.Body)
+	res.Body.Close()
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("state mismatch must return 400, got %d (%s)", res.StatusCode, body)
+	}
+	if !strings.Contains(string(body), codeStateMismatch) {
+		t.Fatalf("expected %q error code, got body: %s", codeStateMismatch, body)
 	}
 }
 

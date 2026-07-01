@@ -2,7 +2,11 @@ package http
 
 import (
 	"context"
+	"net/http"
+	"os"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -55,9 +59,19 @@ func TestLoadIntrospect(t *testing.T) {
 			samples := make([]time.Duration, 0, perWork)
 			for i := 0; i < perWork; i++ {
 				t0 := time.Now()
-				res, _ := h.introspect(token)
+				res, body := h.introspect(token)
 				samples = append(samples, time.Since(t0))
-				_ = res
+				// Correctness guard: a fast error must not pass the SLO.
+				// Every request hits a live, valid session, so it must
+				// return 200 with an active introspection result.
+				if res.StatusCode != http.StatusOK {
+					t.Errorf("introspect status %d, want 200", res.StatusCode)
+					return
+				}
+				if !strings.Contains(body, `"active":true`) {
+					t.Errorf("introspect body not active: %s", body)
+					return
+				}
 			}
 			lat[w] = samples
 		}(w)
@@ -81,11 +95,30 @@ func TestLoadIntrospect(t *testing.T) {
 		p50.Round(time.Microsecond), p95.Round(time.Microsecond), p99.Round(time.Microsecond))
 
 	// SLO assertions. These include full HTTP round-trip over loopback +
-	// a real Postgres lookup, so they are conservative.
-	if p50 > 5*time.Millisecond {
-		t.Errorf("p50 %s exceeds 5ms SLO", p50)
+	// a real Postgres lookup, so they are conservative. Thresholds are
+	// overridable so shared CI runners (slower than a dev box) can loosen
+	// them without disabling the correctness guard above; locally they
+	// default to the strict p50<5ms / p99<20ms target.
+	p50Max := sloEnv("SESAMO_LOAD_P50_MAX_MS", 5*time.Millisecond)
+	p99Max := sloEnv("SESAMO_LOAD_P99_MAX_MS", 20*time.Millisecond)
+	if p50 > p50Max {
+		t.Errorf("p50 %s exceeds %s SLO", p50, p50Max)
 	}
-	if p99 > 20*time.Millisecond {
-		t.Errorf("p99 %s exceeds 20ms SLO", p99)
+	if p99 > p99Max {
+		t.Errorf("p99 %s exceeds %s SLO", p99, p99Max)
 	}
+}
+
+// sloEnv reads an integer millisecond threshold from the environment,
+// falling back to def when unset or unparseable.
+func sloEnv(name string, def time.Duration) time.Duration {
+	v := os.Getenv(name)
+	if v == "" {
+		return def
+	}
+	ms, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return time.Duration(ms) * time.Millisecond
 }

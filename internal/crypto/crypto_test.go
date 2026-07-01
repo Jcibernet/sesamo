@@ -3,6 +3,7 @@ package crypto
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/bcrypt"
 )
@@ -54,6 +55,26 @@ func TestUUIDv7FormatAndOrdering(t *testing.T) {
 		prev = id
 	}
 	_ = prev
+
+	// v7's point is time-ordering for DB-index locality: the 48-bit
+	// timestamp prefix must be non-decreasing over time. Within a single
+	// millisecond the low bits are random (not monotonic), so we compare
+	// only the timestamp prefix and step the clock past a ms boundary.
+	// A scrambled timestamp would pass the format checks above but fail
+	// this.
+	tsPrefix := func(id string) string { return id[0:8] + id[9:13] } // 48-bit ts, hex
+	last := tsPrefix(UUIDv7())
+	for i := 0; i < 5; i++ {
+		time.Sleep(2 * time.Millisecond)
+		cur := tsPrefix(UUIDv7())
+		if cur < last {
+			t.Fatalf("uuid timestamp prefix went backwards: %q < %q", cur, last)
+		}
+		if cur == last {
+			t.Fatalf("uuid timestamp prefix did not advance after sleep: %q", cur)
+		}
+		last = cur
+	}
 }
 
 func TestArgon2idRoundTrip(t *testing.T) {
