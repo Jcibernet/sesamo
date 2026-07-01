@@ -1,0 +1,124 @@
+/* Sésamo base theme — design tokens first, then minimal layout.
+   Override any token by serving your own stylesheet via
+   SESAMO_THEME_CSS_URL; it loads AFTER this file so your :root wins. */
+
+:root {
+  /* color tokens */
+  --sesamo-bg: #0f1115;
+  --sesamo-surface: #1a1d24;
+  --sesamo-border: #2a2f3a;
+  --sesamo-text: #e6e8ec;
+  --sesamo-text-muted: #9aa1ad;
+  --sesamo-primary: #6d5efc;
+  --sesamo-primary-text: #ffffff;
+  --sesamo-danger: #f05252;
+
+  /* shape + spacing tokens */
+  --sesamo-radius: 10px;
+  --sesamo-gap: 12px;
+  --sesamo-maxw: 360px;
+  --sesamo-font: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  background: var(--sesamo-bg);
+  color: var(--sesamo-text);
+  font-family: var(--sesamo-font);
+}
+
+.sesamo-card {
+  width: 100%;
+  max-width: var(--sesamo-maxw);
+  background: var(--sesamo-surface);
+  border: 1px solid var(--sesamo-border);
+  border-radius: var(--sesamo-radius);
+  padding: 28px;
+}
+
+.sesamo-card h1 {
+  margin: 0 0 20px;
+  font-size: 1.25rem;
+  text-align: center;
+}
+
+.sesamo-field { margin-bottom: var(--sesamo-gap); }
+
+.sesamo-field label {
+  display: block;
+  font-size: 0.8rem;
+  color: var(--sesamo-text-muted);
+  margin-bottom: 4px;
+}
+
+.sesamo-field input {
+  width: 100%;
+  padding: 10px 12px;
+  border-radius: var(--sesamo-radius);
+  border: 1px solid var(--sesamo-border);
+  background: var(--sesamo-bg);
+  color: var(--sesamo-text);
+  font-size: 0.95rem;
+}
+
+.sesamo-btn {
+  display: block;
+  width: 100%;
+  padding: 11px 12px;
+  border: 0;
+  border-radius: var(--sesamo-radius);
+  background: var(--sesamo-primary);
+  color: var(--sesamo-primary-text);
+  font-size: 0.95rem;
+  font-weight: 600;
+  cursor: pointer;
+  text-align: center;
+  text-decoration: none;
+}
+
+.sesamo-btn.secondary {
+  background: transparent;
+  border: 1px solid var(--sesamo-border);
+  color: var(--sesamo-text);
+  font-weight: 500;
+}
+
+.sesamo-sep {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--sesamo-text-muted);
+  font-size: 0.75rem;
+  margin: var(--sesamo-gap) 0;
+}
+.sesamo-sep::before, .sesamo-sep::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--sesamo-border);
+}
+
+.sesamo-providers { display: grid; gap: 8px; }
+
+.sesamo-error {
+  background: color-mix(in srgb, var(--sesamo-danger) 15%, transparent);
+  border: 1px solid var(--sesamo-danger);
+  color: var(--sesamo-danger);
+  border-radius: var(--sesamo-radius);
+  padding: 8px 12px;
+  font-size: 0.85rem;
+  margin-bottom: var(--sesamo-gap);
+}
+
+.sesamo-foot {
+  margin-top: 16px;
+  text-align: center;
+  font-size: 0.8rem;
+  color: var(--sesamo-text-muted);
+}
+.sesamo-foot a { color: var(--sesamo-primary); text-decoration: none; }

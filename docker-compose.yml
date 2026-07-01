@@ -1,0 +1,20 @@
+# Dedicated, isolated Postgres for Sésamo dev.
+# Separate database, separate user, dedicated port 7432, own data volume.
+# Does NOT touch any other project's Postgres.
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: sesamo_pg
+    environment:
+      POSTGRES_USER: sesamo
+      POSTGRES_PASSWORD: sesamo
+      POSTGRES_DB: sesamo_dev
+    ports:
+      - "7432:5432"
+    volumes:
+      - ./.pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sesamo -d sesamo_dev"]
+      interval: 2s
+      timeout: 3s
+      retries: 20

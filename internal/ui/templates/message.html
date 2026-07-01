@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.Title}}</title>
+  <link rel="stylesheet" href="{{.BaseURL}}/ui/theme.css">
+  {{if .ThemeCSSURL}}<link rel="stylesheet" href="{{.ThemeCSSURL}}">{{end}}
+</head>
+<body>
+  <main class="sesamo-card">
+    <h1>{{.Title}}</h1>
+    <p style="color:var(--sesamo-text-muted);text-align:center;margin:0">{{.Body}}</p>
+    <p class="sesamo-foot"><a href="{{.BaseURL}}/login">Volver</a></p>
+  </main>
+</body>
+</html>
