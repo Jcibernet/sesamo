@@ -1,6 +1,16 @@
-# Sésamo
+<p align="center">
+  <img src=".github/banner.svg" alt="Sésamo" width="100%">
+</p>
 
-![12 de 10](docs/12-de-10.svg)
+<p align="center">
+  <a href="https://github.com/Jcibernet/sesamo/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Jcibernet/sesamo/ci.yml?style=for-the-badge&labelColor=0d1117&color=56d364&label=CI" alt="ci"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/LICENSE-FSL--1.1-3fb950?style=for-the-badge&labelColor=0d1117" alt="license"></a>
+  <img src="https://img.shields.io/badge/GO-%3E%3D1.26-2ea043?style=for-the-badge&labelColor=0d1117" alt="go">
+  <img src="https://img.shields.io/badge/INTROSPECT_P99-%3C20MS-d29922?style=for-the-badge&labelColor=0d1117" alt="latency">
+  <img src="docs/12-de-10.svg" alt="12 de 10">
+</p>
+
+# Sésamo
 
 A single-binary authentication server. Opaque Postgres-backed sessions,
 OAuth (Google / GitHub / Apple), email flows (magic-link, password reset,

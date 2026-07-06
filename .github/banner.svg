@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="300" viewBox="0 0 900 300" role="img" aria-label="Sésamo — single-binary auth server">
+  <title>Sésamo</title>
+  <defs>
+    <pattern id="scan" width="4" height="4" patternUnits="userSpaceOnUse">
+      <rect width="4" height="2" fill="#000000" opacity="0.10"/>
+    </pattern>
+  </defs>
+  <rect width="900" height="300" rx="10" fill="#0a0e0a"/>
+  <rect x="8" y="8" width="884" height="284" rx="6" fill="none" stroke="#1f6f35" stroke-width="1.5"/>
+  <rect x="14" y="14" width="872" height="272" rx="4" fill="none" stroke="#1f6f35" stroke-width="0.5" opacity="0.5"/>
+  <text x="38" y="34" xml:space="preserve" text-anchor="start" font-family="ui-monospace, 'Cascadia Mono', 'DejaVu Sans Mono', Menlo, Consolas, monospace" font-size="13" fill="#3fb950">── sesamo@prod ── login ── 80×24 ──</text>
+  <text x="862" y="34" xml:space="preserve" text-anchor="end" font-family="ui-monospace, 'Cascadia Mono', 'DejaVu Sans Mono', Menlo, Consolas, monospace" font-size="13" fill="#1f6f35">● ● ●</text>
+  <text x="38" y="66" xml:space="preserve" text-anchor="start" font-family="ui-monospace, 'Cascadia Mono', 'DejaVu Sans Mono', Menlo, Consolas, monospace" font-size="15" fill="#56d364">$ ./sesamo serve</text>
+  <text x="38" y="86" xml:space="preserve" text-anchor="start" font-family="ui-monospace, 'Cascadia Mono', 'DejaVu Sans Mono', Menlo, Consolas, monospace" font-size="13" fill="#3fb950">ok  listening :7777 · postgres up · migrations applied</text>
+  <text x="450" y="116" xml:space="preserve" text-anchor="middle" font-family="ui-monospace, 'Cascadia Mono', 'DejaVu Sans Mono', Menlo, Consolas, monospace" font-size="17" fill="#56d364">███████╗███████╗███████╗ █████╗ ███╗   ███╗ ██████╗ </text>
+  <text x="450" y="135" xml:space="preserve" text-anchor="middle" font-family="ui-monospace, 'Cascadia Mono', 'DejaVu Sans Mono', Menlo, Consolas, monospace" font-size="17" fill="#56d364">██╔════╝██╔════╝██╔════╝██╔══██╗████╗ ████║██╔═══██╗</text>
+  <text x="450" y="154" xml:space="preserve" text-anchor="middle" font-family="ui-monospace, 'Cascadia Mono', 'DejaVu Sans Mono', Menlo, Consolas, monospace" font-size="17" fill="#56d364">███████╗█████╗  ███████╗███████║██╔████╔██║██║   ██║</text>
+  <text x="450" y="173" xml:space="preserve" text-anchor="middle" font-family="ui-monospace, 'Cascadia Mono', 'DejaVu Sans Mono', Menlo, Consolas, monospace" font-size="17" fill="#56d364">╚════██║██╔══╝  ╚════██║██╔══██║██║╚██╔╝██║██║   ██║</text>
+  <text x="450" y="192" xml:space="preserve" text-anchor="middle" font-family="ui-monospace, 'Cascadia Mono', 'DejaVu Sans Mono', Menlo, Consolas, monospace" font-size="17" fill="#56d364">███████║███████╗███████║██║  ██║██║ ╚═╝ ██║╚██████╔╝</text>
+  <text x="450" y="211" xml:space="preserve" text-anchor="middle" font-family="ui-monospace, 'Cascadia Mono', 'DejaVu Sans Mono', Menlo, Consolas, monospace" font-size="17" fill="#56d364">╚══════╝╚══════╝╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝ ╚═════╝ </text>
+  <text x="450" y="246" xml:space="preserve" text-anchor="middle" font-family="ui-monospace, 'Cascadia Mono', 'DejaVu Sans Mono', Menlo, Consolas, monospace" font-size="13.5" fill="#3fb950">one static binary · opaque sessions · introspect &lt;1ms · no JWTs · no SDK</text>
+  <text x="38" y="274" xml:space="preserve" text-anchor="start" font-family="ui-monospace, 'Cascadia Mono', 'DejaVu Sans Mono', Menlo, Consolas, monospace" font-size="15" fill="#56d364">$ </text>
+  <text x="862" y="274" xml:space="preserve" text-anchor="end" font-family="ui-monospace, 'Cascadia Mono', 'DejaVu Sans Mono', Menlo, Consolas, monospace" font-size="14" fill="#d29922">[ ★ 12/10 ]</text>
+  <rect x="58" y="262" width="9" height="16" fill="#56d364"/>
+  <rect width="900" height="300" rx="10" fill="url(#scan)"/>
+</svg>
