@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Nueva contraseña</title>
+  <link rel="stylesheet" href="{{.BaseURL}}/ui/theme.css">
+  {{if .BrandCSS}}<link rel="stylesheet" href="{{.BaseURL}}/ui/brand.css">{{end}}
+  {{if .ThemeCSSURL}}<link rel="stylesheet" href="{{.ThemeCSSURL}}">{{end}}
+</head>
+<body>
+  <main class="sesamo-card">
+    {{if .LogoURL}}<img class="sesamo-logo" src="{{.LogoURL}}" alt="">{{end}}
+    <h1>Elegí una contraseña nueva</h1>
+    <form method="POST" action="{{.BaseURL}}/reset/confirm">
+      <input type="hidden" name="token" value="{{.Token}}">
+      <div class="sesamo-field">
+        <label for="password">Nueva contraseña</label>
+        <input id="password" name="password" type="password" autocomplete="new-password" minlength="8" required>
+      </div>
+      <button class="sesamo-btn" type="submit">Guardar contraseña</button>
+    </form>
+    <p class="sesamo-foot"><a href="{{.BaseURL}}/login">Volver a iniciar sesión</a></p>
+  </main>
+</body>
+</html>

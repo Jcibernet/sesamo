@@ -2,6 +2,7 @@ package http
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
@@ -42,6 +43,7 @@ func newHarnessWithConfig(t *testing.T, mutate func(*config.Config)) *harness {
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
+	resetRateLimits(t, pool)
 	cfg := &config.Config{
 		BaseURL:                 "http://127.0.0.1",
 		CookieName:              "sid",
@@ -392,5 +394,170 @@ func TestThreat16_SecurityHeadersPresent(t *testing.T) {
 		if res.Header.Get(hdr) == "" {
 			t.Fatalf("missing security header %s", hdr)
 		}
+	}
+}
+
+// ── Threat vector 17: spoofed X-Forwarded-For does not bypass the
+// per-IP login rate limit (TrustProxy defaults false) ─────────────────
+func TestThreat17_XFFSpoofDoesNotBypassIPRateLimit(t *testing.T) {
+	h := newHarness(t)
+	c := h.client()
+	var emails []string
+	t.Cleanup(func() {
+		if len(emails) == 0 {
+			return
+		}
+		_, _ = h.pool.Exec(context.Background(),
+			`DELETE FROM audit_log WHERE detail->>'email' = ANY($1)`, emails)
+	})
+	var got429 bool
+	for i := range 30 {
+		email := uniqueEmail(fmt.Sprintf("xff%d", i))
+		emails = append(emails, email)
+		req, _ := http.NewRequest(http.MethodPost, h.srv.URL+"/login",
+			strings.NewReader(url.Values{"email": {email}, "password": {"whatever-bad"}}.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("Accept", "application/json")
+		// Spoofed, per-request X-Forwarded-For: if this were honored, each
+		// request would mint a fresh per-IP bucket and 429 would never fire.
+		req.Header.Set("X-Forwarded-For", fmt.Sprintf("10.0.0.%d", i))
+		res, err := c.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		if res.StatusCode == http.StatusTooManyRequests {
+			got429 = true
+			break
+		}
+	}
+	if !got429 {
+		t.Fatal("expected the shared RemoteAddr bucket to trip 429 despite a fresh spoofed XFF per request")
+	}
+}
+
+// ── Threat vector 18: security-relevant events are written to the
+// audit trail (STRIDE: repudiation) ───────────────────────────────────
+func TestThreat18_AuditTrailWritten(t *testing.T) {
+	h := newHarness(t)
+	email := uniqueEmail("audit")
+	password := "correct-horse-99"
+	h.signup(email, password)
+
+	var userID string
+	if err := h.pool.QueryRow(context.Background(),
+		`SELECT id FROM users WHERE email = $1`, email).Scan(&userID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = h.pool.Exec(context.Background(),
+			`DELETE FROM audit_log WHERE actor_user = $1 OR detail->>'email' = $2`, userID, email)
+	})
+
+	c := h.client()
+	h.postJSON(c, "/login", url.Values{"email": {email}, "password": {password}})
+	h.postJSON(c, "/login", url.Values{"email": {email}, "password": {"wrong-password"}})
+	h.postJSON(c, "/logout", url.Values{})
+
+	var n int
+	if err := h.pool.QueryRow(context.Background(), `
+		SELECT count(*) FROM audit_log
+		 WHERE event = 'login.success' AND actor_user = $1 AND detail->>'method' = 'password'`,
+		userID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n < 1 {
+		t.Fatal("expected a login.success audit row with actor_user set and detail.method=password")
+	}
+
+	if err := h.pool.QueryRow(context.Background(), `
+		SELECT count(*) FROM audit_log
+		 WHERE event = 'login.failed' AND detail->>'email' = $1`,
+		email).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n < 1 {
+		t.Fatal("expected a login.failed audit row for the wrong-password attempt")
+	}
+
+	if err := h.pool.QueryRow(context.Background(), `
+		SELECT count(*) FROM audit_log
+		 WHERE event = 'logout' AND actor_user = $1`,
+		userID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n < 1 {
+		t.Fatal("expected a logout audit row with actor_user set to the user id")
+	}
+}
+
+// ── Threat vector 19: oversized request bodies are rejected before
+// handler logic runs (STRIDE: denial of service) ───────────────────────
+func TestThreat19_OversizedBodyRejected(t *testing.T) {
+	h := newHarness(t)
+	c := h.client()
+
+	padding := strings.Repeat("a", 128<<10) // 128 KiB, well past the 64 KiB cap
+	form := url.Values{
+		"email":    {uniqueEmail("oversized")},
+		"password": {"whatever-12345"},
+		"padding":  {padding},
+	}
+	res, _ := h.postJSON(c, "/login", form)
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for an oversized body, got %d", res.StatusCode)
+	}
+	if h.sidCookie(c) != "" {
+		t.Fatal("an oversized body must never result in a session cookie")
+	}
+}
+
+// newStrictHarness is a local variant of newHarness with AuditStrict
+// enabled (SESAMO_AUDIT_STRICT=true), used to verify that strict mode
+// does not alter behavior when the database is healthy — it must only
+// bite on write failure, never on the happy path.
+func newStrictHarness(t *testing.T) *harness {
+	return newHarnessWithConfig(t, func(cfg *config.Config) {
+		cfg.AuditStrict = true
+	})
+}
+
+// ── Strict audit mode: a healthy database must not change behavior on
+// the happy path (SESAMO_AUDIT_STRICT only bites when the write fails,
+// see internal/audit for the failure-injection unit tests) ───────────
+func TestThreat20_StrictAuditHealthyLoginUnaffected(t *testing.T) {
+	h := newStrictHarness(t)
+	email := uniqueEmail("strict-audit")
+	password := "correct-horse-99"
+	h.signup(email, password)
+
+	var userID string
+	if err := h.pool.QueryRow(context.Background(),
+		`SELECT id FROM users WHERE email = $1`, email).Scan(&userID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = h.pool.Exec(context.Background(),
+			`DELETE FROM audit_log WHERE actor_user = $1`, userID)
+	})
+
+	c := h.client()
+	res, body := h.postJSON(c, "/login", url.Values{"email": {email}, "password": {password}})
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 on login with strict audit + healthy DB, got %d: %s", res.StatusCode, body)
+	}
+	if h.sidCookie(c) == "" {
+		t.Fatal("expected sid cookie to be set after a successful strict-mode login")
+	}
+
+	var n int
+	if err := h.pool.QueryRow(context.Background(), `
+		SELECT count(*) FROM audit_log
+		 WHERE event = 'login.success' AND actor_user = $1 AND detail->>'method' = 'password'`,
+		userID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n < 1 {
+		t.Fatal("expected a login.success audit row even in strict mode against a healthy DB")
 	}
 }

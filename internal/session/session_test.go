@@ -91,8 +91,12 @@ func TestRevokeKillsSessionImmediately(t *testing.T) {
 	ctx := context.Background()
 
 	created, _ := s.Create(ctx, CreateInput{UserID: uid})
-	if err := s.Revoke(ctx, created.Token); err != nil {
+	gotUID, err := s.Revoke(ctx, created.Token)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if gotUID != uid {
+		t.Fatalf("Revoke should return the session's user id: got %q want %q", gotUID, uid)
 	}
 	res, _ := s.Validate(ctx, created.Token)
 	if res.Kind != KindNotFound {
@@ -161,5 +165,40 @@ func TestRollingRenewalExtendsExpiry(t *testing.T) {
 	}
 	if !res.ExpiresAt.After(created.ExpiresAt) {
 		t.Fatalf("expiry not extended: %v <= %v", res.ExpiresAt, created.ExpiresAt)
+	}
+}
+
+func TestPurgeExpiredDeletesExpiredSessions(t *testing.T) {
+	pool := testPool(t)
+	s := newStore(pool)
+	uid := makeUser(t, pool)
+	ctx := context.Background()
+
+	created, err := s.Create(ctx, CreateInput{UserID: uid})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Force the session into the past so PurgeExpired has something to
+	// reap, without waiting out its real lifetime.
+	if _, err := pool.Exec(ctx,
+		`UPDATE sessions SET expires_at = now() - interval '1 hour' WHERE user_id = $1`, uid); err != nil {
+		t.Fatalf("force-expire: %v", err)
+	}
+
+	n, err := s.PurgeExpired(ctx)
+	if err != nil {
+		t.Fatalf("PurgeExpired: %v", err)
+	}
+	if n < 1 {
+		t.Fatalf("PurgeExpired count = %d, want >= 1", n)
+	}
+
+	res, err := s.Validate(ctx, created.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Kind == KindValid {
+		t.Fatal("purged session should no longer validate")
 	}
 }

@@ -3,6 +3,7 @@ package http
 import (
 	"net/http"
 
+	"github.com/jcibernet/sesamo/internal/audit"
 	"github.com/jcibernet/sesamo/internal/crypto"
 )
 
@@ -27,6 +28,9 @@ func (s *Server) handleAdminRevokeUserSessions(w http.ResponseWriter, r *http.Re
 	id := r.PathValue("id")
 	if err := s.sessions.RevokeAllForUser(r.Context(), id); err != nil {
 		writeError(w, http.StatusInternalServerError, codeInternal, "Error interno.")
+		return
+	}
+	if !s.recordAudit(w, r, audit.SessionsRevokedAll, id, map[string]any{"via": "admin"}) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "sessions_revoked"})

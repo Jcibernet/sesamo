@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jcibernet/sesamo/internal/audit"
 	"github.com/jcibernet/sesamo/internal/config"
 	"github.com/jcibernet/sesamo/internal/db"
 	"github.com/jcibernet/sesamo/internal/email"
@@ -17,6 +18,7 @@ import (
 	"github.com/jcibernet/sesamo/internal/oauth"
 	"github.com/jcibernet/sesamo/internal/ratelimit"
 	"github.com/jcibernet/sesamo/internal/session"
+	"github.com/jcibernet/sesamo/internal/ui"
 	"github.com/jcibernet/sesamo/internal/user"
 )
 
@@ -33,6 +35,9 @@ type Server struct {
 	providers *oauth.Registry
 	limiter   *ratelimit.Limiter
 	metrics   *metrics.Registry
+	audit     *audit.Logger
+	brandCSS  []byte // generated /ui/brand.css (nil when branding unset)
+	csp       string // precomputed Content-Security-Policy value
 }
 
 // NewServer builds the full handler tree.
@@ -52,14 +57,17 @@ func NewServer(cfg *config.Config, pool *db.Pool, log *slog.Logger) http.Handler
 		providers: buildProviders(cfg, log),
 		limiter:   ratelimit.New(pool),
 		metrics:   metrics.New(),
+		audit:     audit.New(pool, log, cfg.AuditStrict),
+		brandCSS:  ui.BrandCSS(ui.BrandInput(cfg.Brand)),
 	}
+	s.csp = buildCSP(cfg)
 
 	s.registerOps()     // healthz, readyz, metrics
 	s.registerEndUser() // /login, /logout, /signup, /reset, /auth/*
 	s.registerService() // /v1/introspect, /v1/sessions/revoke
 	s.registerAdmin()   // /v1/admin/*
 
-	return s.withSecurityHeaders(s.withLogging(s.mux))
+	return s.withSecurityHeaders(s.withLogging(s.withBodyLimit(s.mux)))
 }
 
 func buildProviders(cfg *config.Config, log *slog.Logger) *oauth.Registry {
@@ -80,6 +88,28 @@ func buildProviders(cfg *config.Config, log *slog.Logger) *oauth.Registry {
 		}
 	}
 	return reg
+}
+
+// buildCSP assembles the Content-Security-Policy once at startup. The
+// base is strict ('self', no inline scripts); the ONLY relaxations are
+// the exact operator-configured origins: the override stylesheet
+// (style-src), the brand logo host (img-src), and the brand font host
+// (font-src). Never wildcards.
+func buildCSP(cfg *config.Config) string {
+	style := "style-src 'self'"
+	if cfg.ThemeCSSURL != "" {
+		style += " " + cfg.ThemeCSSURL
+	}
+	img := "img-src 'self' data:"
+	if o := config.Origin(cfg.Brand.LogoURL); o != "" {
+		img += " " + o
+	}
+	font := "font-src 'self'"
+	if o := config.Origin(cfg.Brand.FontURL); o != "" {
+		font += " " + o
+	}
+	return "default-src 'self'; " + style + "; " + img + "; " + font +
+		"; form-action 'self'; frame-ancestors 'none'"
 }
 
 // registerOps wires liveness, readiness, and Prometheus metrics.
@@ -113,8 +143,7 @@ func (s *Server) withSecurityHeaders(next http.Handler) http.Handler {
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("X-Frame-Options", "DENY")
 		h.Set("Referrer-Policy", "strict-origin-when-cross-origin")
-		h.Set("Content-Security-Policy",
-			"default-src 'self'; style-src 'self' "+s.cfg.ThemeCSSURL+"; img-src 'self' data:; form-action 'self'; frame-ancestors 'none'")
+		h.Set("Content-Security-Policy", s.csp)
 		if s.cfg.CookieSecure {
 			h.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
 		}
@@ -142,7 +171,7 @@ func (s *Server) withLogging(next http.Handler) http.Handler {
 			"path", r.URL.Path,
 			"status", rw.status,
 			"dur_ms", elapsed.Milliseconds(),
-			"ip", clientIP(r),
+			"ip", s.clientIP(r),
 		)
 	})
 }
@@ -157,14 +186,51 @@ func (r *statusRecorder) WriteHeader(code int) {
 	r.ResponseWriter.WriteHeader(code)
 }
 
-// clientIP extracts the best-effort client IP. We take the first hop of
-// X-Forwarded-For when present (set by the trusted proxy/platform), else
-// the remote address. This value is metadata only, never used for auth
-// decisions, so spoofing it has no security impact beyond log accuracy.
-func clientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		first, _, _ := strings.Cut(xff, ",")
-		return strings.TrimSpace(first)
+// maxBodyBytes caps request bodies. Every legitimate body Sésamo accepts
+// is a small form or JSON payload (credentials, a token); 64 KiB is two
+// orders of magnitude above any of them. This bounds memory per request
+// against slow-POST / oversized-body abuse (STRIDE: denial of service).
+const maxBodyBytes = 64 << 10
+
+// withBodyLimit wraps every request body in http.MaxBytesReader. Form
+// parsing past the cap fails, so handlers see empty values and return
+// their normal validation errors.
+func (s *Server) withBodyLimit(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// recordAudit writes an audit event for the current request. In strict
+// mode (SESAMO_AUDIT_STRICT) a failed write responds 500 and returns
+// false: the caller MUST stop — no evidence, no action. In best-effort
+// mode it always returns true. Anti-enumeration endpoints whose response
+// must stay identical for existing and unknown identities must NOT use
+// this helper (a 500 would become an existence oracle); they check
+// Record's error themselves and degrade silently.
+func (s *Server) recordAudit(w http.ResponseWriter, r *http.Request, e audit.Event, actorUser string, detail map[string]any) bool {
+	if err := s.audit.Record(r.Context(), e, actorUser, s.clientIP(r), detail); err != nil {
+		writeError(w, http.StatusInternalServerError, codeInternal, "Error interno.")
+		return false
+	}
+	return true
+}
+
+// clientIP extracts the client IP. X-Forwarded-For is honored ONLY when
+// SESAMO_TRUST_PROXY is set, because this value keys the per-IP login
+// rate limiter: honoring a client-controlled header would let an
+// attacker mint a fresh bucket per request and bypass the brute-force
+// limit (and grow rate_limit_buckets without bound). Behind a trusted
+// proxy that overwrites the header, the first hop is the real client.
+func (s *Server) clientIP(r *http.Request) string {
+	if s.cfg.TrustProxy {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			first, _, _ := strings.Cut(xff, ",")
+			return strings.TrimSpace(first)
+		}
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {

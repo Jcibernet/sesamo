@@ -5,10 +5,12 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Iniciar sesión</title>
   <link rel="stylesheet" href="{{.BaseURL}}/ui/theme.css">
+  {{if .BrandCSS}}<link rel="stylesheet" href="{{.BaseURL}}/ui/brand.css">{{end}}
   {{if .ThemeCSSURL}}<link rel="stylesheet" href="{{.ThemeCSSURL}}">{{end}}
 </head>
 <body>
   <main class="sesamo-card">
+    {{if .LogoURL}}<img class="sesamo-logo" src="{{.LogoURL}}" alt="">{{end}}
     <h1>Iniciar sesión</h1>
 
     {{if .Error}}<div class="sesamo-error" role="alert">No pudimos iniciar sesión. Probá de nuevo.</div>{{end}}
@@ -24,13 +26,18 @@
         <input id="password" name="password" type="password" autocomplete="current-password" required>
       </div>
       <button class="sesamo-btn" type="submit">Entrar</button>
+      {{if .MagicLink}}
+      <button class="sesamo-btn secondary sesamo-mt" type="submit"
+              formaction="{{.BaseURL}}/magiclink" formnovalidate>Enviarme un enlace de acceso</button>
+      {{end}}
     </form>
-    {{end}}
-
-    {{if .MagicLink}}
-    <form method="POST" action="{{.BaseURL}}/magiclink" style="margin-top:8px">
-      <input type="hidden" name="email" value="">
-      <button class="sesamo-btn secondary" type="submit">Enviarme un enlace de acceso</button>
+    {{else if .MagicLink}}
+    <form method="POST" action="{{.BaseURL}}/magiclink">
+      <div class="sesamo-field">
+        <label for="email">Email</label>
+        <input id="email" name="email" type="email" autocomplete="email" required>
+      </div>
+      <button class="sesamo-btn" type="submit">Enviarme un enlace de acceso</button>
     </form>
     {{end}}
 
