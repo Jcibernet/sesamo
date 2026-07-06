@@ -1,0 +1,6 @@
+.git
+.pgdata
+.env*
+docs/
+*.md
+docker-compose.yml
