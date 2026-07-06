@@ -9,12 +9,16 @@ import (
 
 	"github.com/jcibernet/sesamo/internal/config"
 	"github.com/jcibernet/sesamo/internal/db"
+	"github.com/jcibernet/sesamo/internal/email"
 	httpapi "github.com/jcibernet/sesamo/internal/http"
+	"github.com/jcibernet/sesamo/internal/ratelimit"
+	"github.com/jcibernet/sesamo/internal/session"
 )
 
 // serve wires the HTTP handler and runs the server until ctx is done.
 func serve(ctx context.Context, cfg *config.Config, pool *db.Pool, log *slog.Logger) error {
 	handler := httpapi.NewServer(cfg, pool, log)
+	go runMaintenance(ctx, cfg, pool, log)
 
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -37,5 +41,51 @@ func serve(ctx context.Context, cfg *config.Config, pool *db.Pool, log *slog.Log
 		return srv.Shutdown(shutdownCtx)
 	case err := <-errc:
 		return err
+	}
+}
+
+// maintenanceInterval is how often expired state is purged. Expired
+// sessions are also deleted opportunistically on Validate, so this only
+// needs to catch abandoned rows; hourly keeps tables tight without
+// measurable load.
+const maintenanceInterval = time.Hour
+
+// runMaintenance periodically deletes rows that can no longer affect
+// behavior: expired sessions, dead one-time tokens, and rate-limit
+// buckets that have fully refilled. Unbounded growth of any of these is
+// a denial-of-service vector (disk, index bloat) — see THREAT_MODEL.md.
+func runMaintenance(ctx context.Context, cfg *config.Config, pool *db.Pool, log *slog.Logger) {
+	sessions := session.NewStore(pool, session.Config{
+		Lifetime:                cfg.SessionLifetime,
+		RollingRenewalThreshold: cfg.RollingRenewalThreshold,
+	})
+	tokens := email.NewTokenStore(pool)
+	limiter := ratelimit.New(pool)
+
+	t := time.NewTicker(maintenanceInterval)
+	defer t.Stop()
+	for {
+		mctx, cancel := context.WithTimeout(ctx, time.Minute)
+		ns, err := sessions.PurgeExpired(mctx)
+		if err != nil {
+			log.Warn("purge sessions", "err", err)
+		}
+		nt, err := tokens.PurgeExpired(mctx)
+		if err != nil {
+			log.Warn("purge tokens", "err", err)
+		}
+		nb, err := limiter.PurgeStale(mctx, 24*time.Hour)
+		if err != nil {
+			log.Warn("purge rate limit buckets", "err", err)
+		}
+		cancel()
+		if ns+nt+nb > 0 {
+			log.Info("maintenance purge", "sessions", ns, "tokens", nt, "buckets", nb)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
 	}
 }

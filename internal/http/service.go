@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/jcibernet/sesamo/internal/audit"
 	"github.com/jcibernet/sesamo/internal/crypto"
 	"github.com/jcibernet/sesamo/internal/session"
 )
@@ -71,9 +72,15 @@ func (s *Server) handleSessionRevoke(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, codeInvalidRequest, "Falta el token de sesión.")
 		return
 	}
-	if err := s.sessions.Revoke(r.Context(), token); err != nil {
+	uid, err := s.sessions.Revoke(r.Context(), token)
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, codeInternal, "Error interno.")
 		return
+	}
+	if uid != "" {
+		if !s.recordAudit(w, r, audit.SessionRevoked, uid, map[string]any{"via": "service"}) {
+			return
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "revoked"})
 }

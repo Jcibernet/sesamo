@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Restablecer contraseña</title>
+  <link rel="stylesheet" href="{{.BaseURL}}/ui/theme.css">
+  {{if .BrandCSS}}<link rel="stylesheet" href="{{.BaseURL}}/ui/brand.css">{{end}}
+  {{if .ThemeCSSURL}}<link rel="stylesheet" href="{{.ThemeCSSURL}}">{{end}}
+</head>
+<body>
+  <main class="sesamo-card">
+    {{if .LogoURL}}<img class="sesamo-logo" src="{{.LogoURL}}" alt="">{{end}}
+    <h1>Restablecer contraseña</h1>
+    <p class="sesamo-note sesamo-mb">Ingresá tu email y te enviamos un enlace para elegir una contraseña nueva.</p>
+    <form method="POST" action="{{.BaseURL}}/reset">
+      <div class="sesamo-field">
+        <label for="email">Email</label>
+        <input id="email" name="email" type="email" autocomplete="email" required>
+      </div>
+      <button class="sesamo-btn" type="submit">Enviarme el enlace</button>
+    </form>
+    <p class="sesamo-foot"><a href="{{.BaseURL}}/login">Volver a iniciar sesión</a></p>
+  </main>
+</body>
+</html>

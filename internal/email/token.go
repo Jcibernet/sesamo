@@ -90,3 +90,16 @@ func (s *TokenStore) Consume(ctx context.Context, token string, purpose Purpose)
 	}
 	return userID, nil
 }
+
+// PurgeExpired deletes tokens that can never be consumed again: expired
+// or already used. Consume requires consumed_at IS NULL and an unexpired
+// row, so these are dead weight; the audit log is the forensic record.
+// Intended to be called from a periodic job.
+func (s *TokenStore) PurgeExpired(ctx context.Context) (int64, error) {
+	tag, err := s.pool.Exec(ctx,
+		`DELETE FROM one_time_tokens WHERE expires_at <= now() OR consumed_at IS NOT NULL`)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}

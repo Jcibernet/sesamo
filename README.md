@@ -1,5 +1,7 @@
 # Sésamo
 
+![12 de 10](docs/12-de-10.svg)
+
 A single-binary authentication server. Opaque Postgres-backed sessions,
 OAuth (Google / GitHub / Apple), email flows (magic-link, password reset,
 verification), an embedded themeable login UI, and a fast
@@ -125,30 +127,65 @@ library. See [`.env.example`](./.env.example) for the full annotated list.
 | `SESAMO_ROLLING_RENEWAL_THRESHOLD_MINUTES` | `15` | Rolling renewal cadence |
 | `SESAMO_SERVICE_TOKEN` | _(required for introspect)_ | S2S bearer token |
 | `SESAMO_ADMIN_API_KEY` | _(required for admin)_ | Admin bearer token |
+| `SESAMO_TRUST_PROXY` | `false` | Honor `X-Forwarded-For` for client IP (rate-limit keying, logs, audit). Enable ONLY behind a proxy that overwrites the header |
+| `SESAMO_AUDIT_STRICT` | `false` | Fail auth operations whose `audit_log` write fails (no evidence, no action). Default: best-effort — availability wins |
 | `SESAMO_{GOOGLE,GITHUB,APPLE}_*` | — | OAuth provider credentials |
 | `SESAMO_EMAIL_PROVIDER` | `log` | `log` / `resend` / `postmark` |
-| `SESAMO_THEME_CSS_URL` | — | Override stylesheet (see Theming) |
+| `SESAMO_THEME_CSS_URL` | — | Full override stylesheet (see Theming) |
+| `SESAMO_BRAND_LOGO_URL` | — | Logo atop the login card (SVG recommended; host is added to CSP `img-src`) |
+| `SESAMO_BRAND_PRIMARY_COLOR` | — | Primary/button/link color, any CSS color |
+| `SESAMO_BRAND_PAGE_BG` | — | Page background: color or `linear-gradient(...)` |
+| `SESAMO_BRAND_FONT_URL` | — | WOFF/WOFF2 font file (host is added to CSP `font-src`) |
 
 ## Theming
 
-The embedded UI is styled entirely with CSS custom properties (design
-tokens). To rebrand, point `SESAMO_THEME_CSS_URL` at a stylesheet that
-overrides the tokens — it loads after the base sheet, so your `:root`
-wins. No template forking, no rebuild.
+Three tiers, mirroring Auth0's customization ladder (no-code branding →
+theme tokens → fully custom UI). They layer: base tokens < brand env
+vars < your stylesheet.
+
+**Tier 1 — no-code branding (env vars only).** Logo, primary color,
+page background, and font, without writing a line of CSS:
+
+```bash
+SESAMO_BRAND_LOGO_URL=https://cdn.example.com/logo.svg
+SESAMO_BRAND_PRIMARY_COLOR="#e11d48"
+SESAMO_BRAND_PAGE_BG="linear-gradient(135deg, #1e1b4b, #312e81)"
+SESAMO_BRAND_FONT_URL=https://cdn.example.com/brand.woff2
+```
+
+Sésamo serves these as a generated `/ui/brand.css`; the strict CSP only
+gains the exact logo/font origins, never wildcards. Values are
+validated at boot — a bad color or URL refuses to start rather than
+rendering broken.
+
+**Tier 2 — design tokens (one stylesheet).** Every visual knob is a CSS
+custom property: page & card colors, inputs (bg/border/text/placeholder/
+label), primary & secondary buttons, link/focus/danger/success states,
+radii per element (card/button/input), card border width/shadow/padding/
+alignment, typography (family/sizes/title weight/alignment), and logo
+height. Point `SESAMO_THEME_CSS_URL` at a stylesheet that overrides any
+of them — it loads last, so your `:root` wins. Derived tokens follow
+their base (override `--sesamo-primary` and links/focus follow), but
+each is individually overridable. The full list lives in
+`internal/ui/assets/theme.css`.
 
 ```css
-/* my-theme.css */
+/* my-theme.css — light theme in six lines */
 :root {
   --sesamo-primary: #e2007a;
   --sesamo-bg: #ffffff;
   --sesamo-surface: #f7f7f9;
   --sesamo-text: #14161a;
   --sesamo-radius: 4px;
+  --sesamo-card-shadow: 0 8px 30px rgb(0 0 0 / 0.08);
 }
 ```
 
-For fully custom UIs, use headless mode: send `Accept: application/json`
-(or `?mode=json`) to any end-user endpoint and render your own screens.
+**Tier 3 — headless (your UI, our API).** Send `Accept:
+application/json` (or `?mode=json`) to any end-user endpoint and render
+your own screens. `GET /login` in JSON mode also returns the operator's
+`branding` object (logo, colors, font, theme URL), so a custom frontend
+can honor the configured look without hardcoding it.
 
 ## Migrating from Auth0
 

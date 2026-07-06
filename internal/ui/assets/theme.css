@@ -1,23 +1,69 @@
 /* Sésamo base theme — design tokens first, then minimal layout.
-   Override any token by serving your own stylesheet via
-   SESAMO_THEME_CSS_URL; it loads AFTER this file so your :root wins. */
+   Token parity with Auth0's Universal Login no-code editor: colors,
+   borders/radii, fonts, widget (card), page background, logo.
+
+   Layering (last wins):
+     1. this file            (base tokens + layout)
+     2. /ui/brand.css        (generated from SESAMO_BRAND_* env vars)
+     3. SESAMO_THEME_CSS_URL (your stylesheet; override any token here)
+
+   Derived tokens default to var(existing-token), so overriding a base
+   token (e.g. --sesamo-primary) restyles everything that derives from
+   it, while every fine-grained knob stays individually overridable. */
 
 :root {
-  /* color tokens */
-  --sesamo-bg: #0f1115;
-  --sesamo-surface: #1a1d24;
+  /* ── color tokens: page & card ─────────────────────────────── */
+  --sesamo-bg: #0f1115;                 /* page background color */
+  --sesamo-page-bg-image: none;         /* url(...) or gradient */
+  --sesamo-surface: #1a1d24;            /* card/widget background */
   --sesamo-border: #2a2f3a;
   --sesamo-text: #e6e8ec;
   --sesamo-text-muted: #9aa1ad;
+
+  /* ── color tokens: actions & states ────────────────────────── */
   --sesamo-primary: #6d5efc;
   --sesamo-primary-text: #ffffff;
+  --sesamo-link: var(--sesamo-primary);
+  --sesamo-focus: var(--sesamo-primary);
   --sesamo-danger: #f05252;
+  --sesamo-success: #31c48d;
 
-  /* shape + spacing tokens */
-  --sesamo-radius: 10px;
+  /* ── color tokens: inputs ──────────────────────────────────── */
+  --sesamo-input-bg: var(--sesamo-bg);
+  --sesamo-input-border: var(--sesamo-border);
+  --sesamo-input-text: var(--sesamo-text);
+  --sesamo-input-placeholder: var(--sesamo-text-muted);
+  --sesamo-label: var(--sesamo-text-muted);
+
+  /* ── color tokens: secondary button ────────────────────────── */
+  --sesamo-btn-secondary-bg: transparent;
+  --sesamo-btn-secondary-border: var(--sesamo-border);
+  --sesamo-btn-secondary-text: var(--sesamo-text);
+
+  /* ── shape tokens ──────────────────────────────────────────── */
+  --sesamo-radius: 10px;                /* base; derived below */
+  --sesamo-card-radius: var(--sesamo-radius);
+  --sesamo-btn-radius: var(--sesamo-radius);
+  --sesamo-input-radius: var(--sesamo-radius);
+  --sesamo-card-border-width: 1px;
+  --sesamo-card-shadow: none;           /* e.g. 0 8px 30px rgb(0 0 0 / .25) */
+  --sesamo-card-padding: 28px;
+  --sesamo-card-align: center;          /* start | center | end (page position) */
+
+  /* ── spacing & sizing tokens ───────────────────────────────── */
   --sesamo-gap: 12px;
   --sesamo-maxw: 360px;
+
+  /* ── typography tokens ─────────────────────────────────────── */
   --sesamo-font: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  --sesamo-font-size: 0.95rem;
+  --sesamo-title-size: 1.25rem;
+  --sesamo-title-weight: 700;
+  --sesamo-title-align: center;
+
+  /* ── logo tokens ───────────────────────────────────────────── */
+  --sesamo-logo-height: 40px;
+  --sesamo-logo-align: center;          /* left | center | right */
 }
 
 * { box-sizing: border-box; }
@@ -26,8 +72,13 @@ body {
   margin: 0;
   min-height: 100vh;
   display: grid;
-  place-items: center;
-  background: var(--sesamo-bg);
+  align-items: center;
+  justify-items: var(--sesamo-card-align);
+  padding: 16px;
+  background-color: var(--sesamo-bg);
+  background-image: var(--sesamo-page-bg-image);
+  background-size: cover;
+  background-position: center;
   color: var(--sesamo-text);
   font-family: var(--sesamo-font);
 }
@@ -36,15 +87,25 @@ body {
   width: 100%;
   max-width: var(--sesamo-maxw);
   background: var(--sesamo-surface);
-  border: 1px solid var(--sesamo-border);
-  border-radius: var(--sesamo-radius);
-  padding: 28px;
+  border: var(--sesamo-card-border-width) solid var(--sesamo-border);
+  border-radius: var(--sesamo-card-radius);
+  box-shadow: var(--sesamo-card-shadow);
+  padding: var(--sesamo-card-padding);
+}
+
+.sesamo-logo {
+  display: block;
+  height: var(--sesamo-logo-height);
+  max-width: 100%;
+  margin: 0 auto 16px;
+  object-fit: contain;
 }
 
 .sesamo-card h1 {
   margin: 0 0 20px;
-  font-size: 1.25rem;
-  text-align: center;
+  font-size: var(--sesamo-title-size);
+  font-weight: var(--sesamo-title-weight);
+  text-align: var(--sesamo-title-align);
 }
 
 .sesamo-field { margin-bottom: var(--sesamo-gap); }
@@ -52,18 +113,26 @@ body {
 .sesamo-field label {
   display: block;
   font-size: 0.8rem;
-  color: var(--sesamo-text-muted);
+  color: var(--sesamo-label);
   margin-bottom: 4px;
 }
 
 .sesamo-field input {
   width: 100%;
   padding: 10px 12px;
-  border-radius: var(--sesamo-radius);
-  border: 1px solid var(--sesamo-border);
-  background: var(--sesamo-bg);
-  color: var(--sesamo-text);
-  font-size: 0.95rem;
+  border-radius: var(--sesamo-input-radius);
+  border: 1px solid var(--sesamo-input-border);
+  background: var(--sesamo-input-bg);
+  color: var(--sesamo-input-text);
+  font-size: var(--sesamo-font-size);
+}
+
+.sesamo-field input::placeholder { color: var(--sesamo-input-placeholder); }
+
+.sesamo-field input:focus-visible,
+.sesamo-btn:focus-visible {
+  outline: 2px solid var(--sesamo-focus);
+  outline-offset: 1px;
 }
 
 .sesamo-btn {
@@ -71,10 +140,10 @@ body {
   width: 100%;
   padding: 11px 12px;
   border: 0;
-  border-radius: var(--sesamo-radius);
+  border-radius: var(--sesamo-btn-radius);
   background: var(--sesamo-primary);
   color: var(--sesamo-primary-text);
-  font-size: 0.95rem;
+  font-size: var(--sesamo-font-size);
   font-weight: 600;
   cursor: pointer;
   text-align: center;
@@ -82,9 +151,9 @@ body {
 }
 
 .sesamo-btn.secondary {
-  background: transparent;
-  border: 1px solid var(--sesamo-border);
-  color: var(--sesamo-text);
+  background: var(--sesamo-btn-secondary-bg);
+  border: 1px solid var(--sesamo-btn-secondary-border);
+  color: var(--sesamo-btn-secondary-text);
   font-weight: 500;
 }
 
@@ -109,7 +178,17 @@ body {
   background: color-mix(in srgb, var(--sesamo-danger) 15%, transparent);
   border: 1px solid var(--sesamo-danger);
   color: var(--sesamo-danger);
-  border-radius: var(--sesamo-radius);
+  border-radius: var(--sesamo-input-radius);
+  padding: 8px 12px;
+  font-size: 0.85rem;
+  margin-bottom: var(--sesamo-gap);
+}
+
+.sesamo-success {
+  background: color-mix(in srgb, var(--sesamo-success) 15%, transparent);
+  border: 1px solid var(--sesamo-success);
+  color: var(--sesamo-success);
+  border-radius: var(--sesamo-input-radius);
   padding: 8px 12px;
   font-size: 0.85rem;
   margin-bottom: var(--sesamo-gap);
@@ -121,4 +200,15 @@ body {
   font-size: 0.8rem;
   color: var(--sesamo-text-muted);
 }
-.sesamo-foot a { color: var(--sesamo-primary); text-decoration: none; }
+.sesamo-foot a { color: var(--sesamo-link); text-decoration: none; }
+
+/* utilities — replace inline style attributes, which the strict CSP
+   (style-src 'self', no 'unsafe-inline') rightly blocks */
+.sesamo-note {
+  color: var(--sesamo-text-muted);
+  text-align: center;
+  font-size: 0.85rem;
+  margin: 0;
+}
+.sesamo-mt { margin-top: 8px; }
+.sesamo-mb { margin-bottom: var(--sesamo-gap); }

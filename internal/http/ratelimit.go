@@ -22,7 +22,7 @@ var (
 // the limiter backend fail OPEN (allow) to avoid locking everyone out on
 // a transient DB hiccup — credential checks themselves remain safe.
 func (s *Server) checkLoginRate(w http.ResponseWriter, r *http.Request, identity string) bool {
-	ip := clientIP(r)
+	ip := s.clientIP(r)
 	if ok := s.allow(w, r, "login_ip:"+ip, loginIPRule); !ok {
 		return false
 	}

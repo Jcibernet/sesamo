@@ -29,13 +29,21 @@ type Rule struct {
 
 // Allow attempts to consume one token from the bucket identified by key.
 // It returns whether the request is allowed and, if not, how long until
-// a token is available. The refill + consume is done atomically with an
-// upsert so concurrent instances cannot oversubscribe.
+// a token is available. Refill and consume run inside one transaction:
+// the upsert takes the row lock, so concurrent instances serialize on
+// the bucket and cannot oversubscribe.
 func (l *Limiter) Allow(ctx context.Context, key string, rule Rule) (bool, time.Duration, error) {
+	tx, err := l.pool.Begin(ctx)
+	if err != nil {
+		return false, 0, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
 	// The bucket starts full. On each call we refill based on elapsed
-	// time, clamp to capacity, then try to spend one token.
+	// time, clamp to capacity, then try to spend one token. The row
+	// stays locked until commit.
 	var tokens float64
-	err := l.pool.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		INSERT INTO rate_limit_buckets (key, tokens, updated_at)
 		VALUES ($1, $2, now())
 		ON CONFLICT (key) DO UPDATE SET
@@ -52,15 +60,37 @@ func (l *Limiter) Allow(ctx context.Context, key string, rule Rule) (bool, time.
 	}
 
 	if tokens >= 1 {
-		if _, err := l.pool.Exec(ctx,
+		if _, err := tx.Exec(ctx,
 			`UPDATE rate_limit_buckets SET tokens = tokens - 1 WHERE key = $1`, key); err != nil {
+			return false, 0, err
+		}
+		if err := tx.Commit(ctx); err != nil {
 			return false, 0, err
 		}
 		return true, 0, nil
 	}
 
-	// Not enough tokens: time until one refills.
+	// Not enough tokens: commit the refill bookkeeping and report the
+	// time until one token is available.
+	if err := tx.Commit(ctx); err != nil {
+		return false, 0, err
+	}
 	needed := 1 - tokens
-	wait := time.Duration(needed/rule.RefillPerSec*float64(time.Second)) * 1
+	wait := time.Duration(needed / rule.RefillPerSec * float64(time.Second))
 	return false, wait, nil
+}
+
+// PurgeStale deletes buckets not touched for olderThan. A bucket that
+// old has fully refilled, so deleting it is behaviorally a no-op — this
+// only bounds table growth (an attacker rotating keys, e.g. spoofed
+// client IPs, would otherwise grow rate_limit_buckets without limit).
+// Intended to be called from a periodic job.
+func (l *Limiter) PurgeStale(ctx context.Context, olderThan time.Duration) (int64, error) {
+	tag, err := l.pool.Exec(ctx,
+		`DELETE FROM rate_limit_buckets WHERE updated_at < now() - make_interval(secs => $1)`,
+		olderThan.Seconds())
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
 }

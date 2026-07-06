@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/jcibernet/sesamo/internal/audit"
 	"github.com/jcibernet/sesamo/internal/crypto"
 	"github.com/jcibernet/sesamo/internal/email"
 	"github.com/jcibernet/sesamo/internal/oauth"
@@ -14,12 +15,15 @@ import (
 func (s *Server) registerEndUser() {
 	s.mux.HandleFunc("GET /login", s.handleLoginPage)
 	s.mux.HandleFunc("GET /ui/theme.css", s.handleThemeCSS)
+	s.mux.HandleFunc("GET /ui/brand.css", s.handleBrandCSS)
 	s.mux.HandleFunc("POST /login", s.handlePasswordLogin)
 	s.mux.HandleFunc("POST /signup", s.handleSignup)
 	s.mux.HandleFunc("POST /logout", s.handleLogout) // POST-only (anti-CSRF)
 	s.mux.HandleFunc("GET /auth/{provider}", s.handleOAuthStart)
 	s.mux.HandleFunc("GET /auth/{provider}/callback", s.handleOAuthCallback)
+	s.mux.HandleFunc("GET /reset", s.handleResetRequestPage)
 	s.mux.HandleFunc("POST /reset", s.handleResetRequest)
+	s.mux.HandleFunc("GET /reset/confirm", s.handleResetConfirmPage)
 	s.mux.HandleFunc("POST /reset/confirm", s.handleResetConfirm)
 	s.mux.HandleFunc("GET /verify", s.handleVerify)
 	s.mux.HandleFunc("POST /magiclink", s.handleMagicLinkRequest)
@@ -31,10 +35,33 @@ func (s *Server) registerEndUser() {
 // ?mode=json) so a custom frontend can render its own UI.
 func (s *Server) handleLoginPage(w http.ResponseWriter, r *http.Request) {
 	if wantsJSON(r) {
-		writeJSON(w, http.StatusOK, map[string]any{
+		payload := map[string]any{
 			"providers": s.providers.Names(),
 			"methods":   []string{"password", "magiclink"},
-		})
+		}
+		// Branding for custom frontends (Auth0 branding-API parity):
+		// a headless UI can render the operator's look without
+		// hardcoding it.
+		if s.cfg.Brand.Active() || s.cfg.ThemeCSSURL != "" {
+			branding := map[string]any{}
+			if s.cfg.Brand.LogoURL != "" {
+				branding["logo_url"] = s.cfg.Brand.LogoURL
+			}
+			if s.cfg.Brand.PrimaryColor != "" {
+				branding["primary_color"] = s.cfg.Brand.PrimaryColor
+			}
+			if s.cfg.Brand.PageBG != "" {
+				branding["page_background"] = s.cfg.Brand.PageBG
+			}
+			if s.cfg.Brand.FontURL != "" {
+				branding["font_url"] = s.cfg.Brand.FontURL
+			}
+			if s.cfg.ThemeCSSURL != "" {
+				branding["theme_css_url"] = s.cfg.ThemeCSSURL
+			}
+			payload["branding"] = branding
+		}
+		writeJSON(w, http.StatusOK, payload)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -44,6 +71,8 @@ func (s *Server) handleLoginPage(w http.ResponseWriter, r *http.Request) {
 		Password:    true,
 		MagicLink:   true,
 		ThemeCSSURL: s.cfg.ThemeCSSURL,
+		BrandCSS:    len(s.brandCSS) > 0,
+		LogoURL:     s.cfg.Brand.LogoURL,
 		Error:       r.URL.Query().Get("error"),
 	}); err != nil {
 		s.log.Error("render login", "err", err)
@@ -61,6 +90,19 @@ func (s *Server) handleThemeCSS(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/css; charset=utf-8")
 	w.Header().Set("Cache-Control", "public, max-age=3600")
 	_, _ = w.Write(css)
+}
+
+// handleBrandCSS serves the stylesheet generated from SESAMO_BRAND_*.
+// 404 when no branding is configured (the templates only link it when
+// it exists, but a hand-typed URL should be honest).
+func (s *Server) handleBrandCSS(w http.ResponseWriter, r *http.Request) {
+	if len(s.brandCSS) == 0 {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "text/css; charset=utf-8")
+	w.Header().Set("Cache-Control", "public, max-age=3600")
+	_, _ = w.Write(s.brandCSS)
 }
 
 // handleOAuthStart redirects to the provider with state + PKCE.
@@ -132,6 +174,10 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !s.recordAudit(w, r, audit.LoginSuccess, res.UserID,
+		map[string]any{"method": "oauth", "provider": name}) {
+		return
+	}
 	s.startSessionAndRedirect(w, r, res.UserID)
 }
 
@@ -158,12 +204,20 @@ func (s *Server) handlePasswordLogin(w http.ResponseWriter, r *http.Request) {
 		// User missing or has no password: do dummy work to equalize
 		// timing, then return the SAME generic error.
 		crypto.DummyVerify(password)
+		if !s.recordAudit(w, r, audit.LoginFailed, "",
+			map[string]any{"method": "password", "email": emailAddr, "reason": "unknown_user"}) {
+			return
+		}
 		writeError(w, http.StatusUnauthorized, codeInvalidCredentials, "Email o contraseña incorrectos.")
 		return
 	}
 
 	valid, needsRehash, err := crypto.VerifyPassword(password, hash)
 	if err != nil || !valid {
+		if !s.recordAudit(w, r, audit.LoginFailed, userID,
+			map[string]any{"method": "password", "email": emailAddr, "reason": "bad_password"}) {
+			return
+		}
 		writeError(w, http.StatusUnauthorized, codeInvalidCredentials, "Email o contraseña incorrectos.")
 		return
 	}
@@ -175,6 +229,10 @@ func (s *Server) handlePasswordLogin(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if !s.recordAudit(w, r, audit.LoginSuccess, userID,
+		map[string]any{"method": "password"}) {
+		return
+	}
 	s.startSessionAndRedirect(w, r, userID)
 }
 
@@ -200,6 +258,9 @@ func (s *Server) handleSignup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !s.recordAudit(w, r, audit.Signup, id, map[string]any{"email": emailAddr}) {
+		return
+	}
 	s.sendOneTimeLink(r, id, emailAddr, email.PurposeVerify, "/verify",
 		"Verificá tu email", 24*time.Hour)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "verification_sent"})
@@ -208,7 +269,11 @@ func (s *Server) handleSignup(w http.ResponseWriter, r *http.Request) {
 // handleLogout invalidates the session and clears the cookie. POST-only.
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if token := cookieValue(r, s.cfg.CookieName); token != "" {
-		_ = s.sessions.Revoke(r.Context(), token)
+		if uid, err := s.sessions.Revoke(r.Context(), token); err == nil && uid != "" {
+			if !s.recordAudit(w, r, audit.Logout, uid, nil) {
+				return
+			}
+		}
 	}
 	s.clearSessionCookie(w)
 	if wantsJSON(r) {
@@ -216,6 +281,70 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Redirect(w, r, "/", http.StatusFound)
+}
+
+// renderMessage writes an outcome page (message.html) with the brand
+// chrome and the given HTTP status. Browser-facing counterpart of the
+// JSON status objects.
+func (s *Server) renderMessage(w http.ResponseWriter, status int, title, body string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(status)
+	if err := ui.RenderMessage(w, ui.MessageData{
+		BaseURL:     s.cfg.BaseURL,
+		Title:       title,
+		Body:        body,
+		ThemeCSSURL: s.cfg.ThemeCSSURL,
+		BrandCSS:    len(s.brandCSS) > 0,
+		LogoURL:     s.cfg.Brand.LogoURL,
+	}); err != nil {
+		s.log.Error("render message", "err", err)
+	}
+}
+
+// handleResetRequestPage renders the "request a reset link" form. The
+// login page links here ("¿Olvidaste tu contraseña?").
+func (s *Server) handleResetRequestPage(w http.ResponseWriter, r *http.Request) {
+	if wantsJSON(r) {
+		writeJSON(w, http.StatusOK, map[string]any{"method": "POST", "fields": []string{"email"}})
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := ui.RenderResetRequest(w, ui.ResetRequestData{
+		BaseURL:     s.cfg.BaseURL,
+		ThemeCSSURL: s.cfg.ThemeCSSURL,
+		BrandCSS:    len(s.brandCSS) > 0,
+		LogoURL:     s.cfg.Brand.LogoURL,
+	}); err != nil {
+		s.log.Error("render reset request", "err", err)
+		writeError(w, http.StatusInternalServerError, codeInternal, "Error interno.")
+	}
+}
+
+// handleResetConfirmPage renders the new-password form for the token in
+// the emailed link. The token is NOT consumed here — only the POST
+// spends it, so previewing the page can't burn the single use.
+func (s *Server) handleResetConfirmPage(w http.ResponseWriter, r *http.Request) {
+	token := r.URL.Query().Get("token")
+	if wantsJSON(r) {
+		writeJSON(w, http.StatusOK, map[string]any{"method": "POST", "fields": []string{"token", "password"}})
+		return
+	}
+	if token == "" {
+		s.renderMessage(w, http.StatusBadRequest, "Enlace inválido",
+			"El enlace no es válido. Pedí uno nuevo desde \"¿Olvidaste tu contraseña?\".")
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := ui.RenderResetConfirm(w, ui.ResetConfirmData{
+		BaseURL:     s.cfg.BaseURL,
+		ThemeCSSURL: s.cfg.ThemeCSSURL,
+		BrandCSS:    len(s.brandCSS) > 0,
+		LogoURL:     s.cfg.Brand.LogoURL,
+		Token:       token,
+	}); err != nil {
+		s.log.Error("render reset confirm", "err", err)
+		writeError(w, http.StatusInternalServerError, codeInternal, "Error interno.")
+	}
 }
 
 // handleResetRequest always returns 200 to avoid revealing whether the
@@ -231,10 +360,20 @@ func (s *Server) handleResetRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	u, err := s.users.ByEmail(r.Context(), emailAddr)
 	if err == nil && u != nil {
-		s.sendOneTimeLink(r, u.ID, emailAddr, email.PurposeReset, "/reset/confirm",
-			"Restablecé tu contraseña", 15*time.Minute)
+		// Evidence before action; on strict-mode audit failure skip the
+		// email but keep the generic 200 — a 500 only for existing
+		// accounts would turn audit outages into an enumeration oracle.
+		if s.audit.Record(r.Context(), audit.ResetRequested, u.ID, s.clientIP(r), nil) == nil {
+			s.sendOneTimeLink(r, u.ID, emailAddr, email.PurposeReset, "/reset/confirm",
+				"Restablecé tu contraseña", 15*time.Minute)
+		}
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "reset_sent"})
+	if wantsJSON(r) {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "reset_sent"})
+		return
+	}
+	s.renderMessage(w, http.StatusOK, "Revisá tu email",
+		"Si existe una cuenta con ese email, te enviamos un enlace para restablecer la contraseña.")
 }
 
 // handleResetConfirm consumes a reset token and sets the new password.
@@ -246,7 +385,12 @@ func (s *Server) handleResetConfirm(w http.ResponseWriter, r *http.Request) {
 	}
 	userID, err := s.tokens.Consume(r.Context(), token, email.PurposeReset)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, codeInvalidRequest, "Token inválido o expirado.")
+		if wantsJSON(r) {
+			writeError(w, http.StatusBadRequest, codeInvalidRequest, "Token inválido o expirado.")
+			return
+		}
+		s.renderMessage(w, http.StatusBadRequest, "Enlace inválido o vencido",
+			"El enlace ya fue usado o expiró. Pedí uno nuevo desde \"¿Olvidaste tu contraseña?\".")
 		return
 	}
 	hash, err := crypto.HashPassword(password)
@@ -260,7 +404,16 @@ func (s *Server) handleResetConfirm(w http.ResponseWriter, r *http.Request) {
 	}
 	// Reset implies privilege change: kill all existing sessions.
 	_ = s.sessions.RevokeAllForUser(r.Context(), userID)
-	writeJSON(w, http.StatusOK, map[string]string{"status": "password_reset"})
+	if !s.recordAudit(w, r, audit.ResetCompleted, userID,
+		map[string]any{"sessions_revoked": "all"}) {
+		return
+	}
+	if wantsJSON(r) {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "password_reset"})
+		return
+	}
+	s.renderMessage(w, http.StatusOK, "Contraseña actualizada",
+		"Tu contraseña fue cambiada y cerramos todas tus sesiones. Iniciá sesión de nuevo.")
 }
 
 // handleVerify consumes an email verification token.
@@ -272,21 +425,40 @@ func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
 	}
 	userID, err := s.tokens.Consume(r.Context(), token, email.PurposeVerify)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, codeInvalidRequest, "Token inválido o expirado.")
+		if wantsJSON(r) {
+			writeError(w, http.StatusBadRequest, codeInvalidRequest, "Token inválido o expirado.")
+			return
+		}
+		s.renderMessage(w, http.StatusBadRequest, "Enlace inválido o vencido",
+			"El enlace de verificación ya fue usado o expiró.")
 		return
 	}
 	if err := s.users.MarkEmailVerified(r.Context(), userID); err != nil {
 		writeError(w, http.StatusInternalServerError, codeInternal, "Error interno.")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "email_verified"})
+	if !s.recordAudit(w, r, audit.EmailVerified, userID, nil) {
+		return
+	}
+	if wantsJSON(r) {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "email_verified"})
+		return
+	}
+	s.renderMessage(w, http.StatusOK, "Email verificado",
+		"Tu email quedó verificado. Ya podés iniciar sesión.")
 }
 
 // handleMagicLinkRequest emails a one-time login link. Always 200.
 func (s *Server) handleMagicLinkRequest(w http.ResponseWriter, r *http.Request) {
 	emailAddr := r.FormValue("email")
 	if emailAddr == "" {
-		writeError(w, http.StatusBadRequest, codeInvalidRequest, "Email requerido.")
+		if wantsJSON(r) {
+			writeError(w, http.StatusBadRequest, codeInvalidRequest, "Email requerido.")
+			return
+		}
+		// Browser: the login form posted without an email — bounce back
+		// with the error banner instead of raw JSON.
+		http.Redirect(w, r, "/login?error=email_required", http.StatusFound)
 		return
 	}
 	if !s.checkLoginRate(w, r, emailAddr) {
@@ -294,10 +466,18 @@ func (s *Server) handleMagicLinkRequest(w http.ResponseWriter, r *http.Request) 
 	}
 	u, err := s.users.ByEmail(r.Context(), emailAddr)
 	if err == nil && u != nil {
-		s.sendOneTimeLink(r, u.ID, emailAddr, email.PurposeMagicLink, "/magiclink/confirm",
-			"Tu enlace de acceso", 15*time.Minute)
+		// Same enumeration-safe degradation as /reset above.
+		if s.audit.Record(r.Context(), audit.MagicLinkRequest, u.ID, s.clientIP(r), nil) == nil {
+			s.sendOneTimeLink(r, u.ID, emailAddr, email.PurposeMagicLink, "/magiclink/confirm",
+				"Tu enlace de acceso", 15*time.Minute)
+		}
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "magiclink_sent"})
+	if wantsJSON(r) {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "magiclink_sent"})
+		return
+	}
+	s.renderMessage(w, http.StatusOK, "Revisá tu email",
+		"Si existe una cuenta con ese email, te enviamos un enlace de acceso.")
 }
 
 // handleMagicLinkConfirm consumes a magic link and starts a session.
@@ -309,11 +489,20 @@ func (s *Server) handleMagicLinkConfirm(w http.ResponseWriter, r *http.Request) 
 	}
 	userID, err := s.tokens.Consume(r.Context(), token, email.PurposeMagicLink)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, codeInvalidRequest, "Enlace inválido o expirado.")
+		if wantsJSON(r) {
+			writeError(w, http.StatusBadRequest, codeInvalidRequest, "Enlace inválido o expirado.")
+			return
+		}
+		s.renderMessage(w, http.StatusBadRequest, "Enlace inválido o vencido",
+			"El enlace de acceso ya fue usado o expiró. Pedí uno nuevo desde la pantalla de inicio de sesión.")
 		return
 	}
 	// A magic link also verifies the email (proof of inbox control).
 	_ = s.users.MarkEmailVerified(r.Context(), userID)
+	if !s.recordAudit(w, r, audit.LoginSuccess, userID,
+		map[string]any{"method": "magiclink"}) {
+		return
+	}
 	s.startSessionAndRedirect(w, r, userID)
 }
 
@@ -321,7 +510,7 @@ func (s *Server) handleMagicLinkConfirm(w http.ResponseWriter, r *http.Request) 
 // returns JSON (headless) or redirects to the post-login target.
 func (s *Server) startSessionAndRedirect(w http.ResponseWriter, r *http.Request, userID string) {
 	ua := r.UserAgent()
-	ip := clientIP(r)
+	ip := s.clientIP(r)
 	created, err := s.sessions.Create(r.Context(), session.CreateInput{
 		UserID: userID, UserAgent: &ua, IPFirst: &ip,
 	})

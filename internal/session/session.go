@@ -148,17 +148,23 @@ func (s *Store) Validate(ctx context.Context, token string) (Result, error) {
 // same user, preserving metadata. Call this on privilege change (login,
 // role change, MFA step-up) to defend against session fixation.
 func (s *Store) Rotate(ctx context.Context, oldToken string, in CreateInput) (Created, error) {
-	if err := s.Revoke(ctx, oldToken); err != nil {
+	if _, err := s.Revoke(ctx, oldToken); err != nil {
 		return Created{}, err
 	}
 	return s.Create(ctx, in)
 }
 
-// Revoke deletes a single session by raw token. Idempotent.
-func (s *Store) Revoke(ctx context.Context, token string) error {
+// Revoke deletes a single session by raw token and returns the user id
+// it belonged to ("" when the token matched nothing). Idempotent.
+func (s *Store) Revoke(ctx context.Context, token string) (string, error) {
 	idHash := crypto.HashToken(token)
-	_, err := s.pool.Exec(ctx, `DELETE FROM sessions WHERE id_hash = $1`, idHash)
-	return err
+	var userID string
+	err := s.pool.QueryRow(ctx,
+		`DELETE FROM sessions WHERE id_hash = $1 RETURNING user_id`, idHash).Scan(&userID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	return userID, err
 }
 
 // RevokeAllForUser deletes every session for a user ("log out everywhere").
