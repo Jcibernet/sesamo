@@ -128,7 +128,7 @@ library. See [`.env.example`](./.env.example) for the full annotated list.
 
 | Variable | Default | Notes |
 |---|---|---|
-| `SESAMO_DATABASE_URL` | _(required)_ | Postgres DSN |
+| `SESAMO_DATABASE_URL` | _(required)_ | Postgres DSN. Pool tuning goes in the DSN via pgx params — e.g. `?pool_max_conns=10&pool_min_conns=2`. Defaults: max conns = `max(4, NumCPU)`, conn lifetime 1 h, idle timeout 30 min. Cap `pool_max_conns` explicitly when sharing a small managed Postgres across replicas |
 | `SESAMO_BASE_URL` | `http://localhost:7777` | Public URL (cookies, OAuth redirects) |
 | `SESAMO_LISTEN_ADDR` | `:7777` | HTTP listen address |
 | `SESAMO_COOKIE_SECURE` | `false` | `true` in production (enables HSTS) |
@@ -139,6 +139,7 @@ library. See [`.env.example`](./.env.example) for the full annotated list.
 | `SESAMO_ADMIN_API_KEY` | _(required for admin)_ | Admin bearer token |
 | `SESAMO_TRUST_PROXY` | `false` | Honor `X-Forwarded-For` for client IP (rate-limit keying, logs, audit). Enable ONLY behind a proxy that overwrites the header |
 | `SESAMO_AUDIT_STRICT` | `false` | Fail auth operations whose `audit_log` write fails (no evidence, no action). Default: best-effort — availability wins |
+| `SESAMO_AUDIT_RETENTION_DAYS` | `0` (keep forever) | When > 0, the hourly maintenance job deletes `audit_log` rows older than N days. Unset = unbounded growth; pick a retention before production |
 | `SESAMO_{GOOGLE,GITHUB,APPLE}_*` | — | OAuth provider credentials |
 | `SESAMO_EMAIL_PROVIDER` | `log` | `log` / `resend` / `postmark` |
 | `SESAMO_THEME_CSS_URL` | — | Full override stylesheet (see Theming) |
@@ -209,8 +210,11 @@ NDJSON, then:
 Bcrypt password hashes are stored **verbatim**, so every user's existing
 password keeps working immediately — no reset emails, no big-bang cutover.
 On each user's first successful login the hash is transparently re-hashed
-from bcrypt to Argon2id (lazy migration). Re-running the import is
-idempotent (existing emails are skipped).
+from bcrypt to Argon2id (lazy migration). Rows are inserted in pipelined
+batches of 500 (one round trip per batch), so a bulk import stays fast
+even against a remote Postgres. Re-running the import is idempotent:
+existing emails are skipped — a skip does **not** update other fields
+(name, `email_verified`) that may have changed in Auth0 since.
 
 ## Security model
 
@@ -268,6 +272,11 @@ Produces a single static binary (~16 MB). It needs only a reachable
 Postgres. `./sesamo serve` runs migrations on boot, so a rolling deploy is
 safe (migrations take a Postgres advisory lock to serialize concurrent
 starts). Health: `/healthz` (liveness), `/readyz` (readiness).
+
+Migrations run `CREATE EXTENSION IF NOT EXISTS pgcrypto, citext`, which
+needs a role allowed to create extensions. Fine on RDS/Supabase/Neon
+defaults; on a restrictive managed Postgres, have a DBA pre-create both
+extensions once and Sésamo needs nothing further.
 
 ## License
 

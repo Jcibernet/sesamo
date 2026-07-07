@@ -3,6 +3,8 @@ package user
 import (
 	"context"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/jcibernet/sesamo/internal/crypto"
 )
 
@@ -41,4 +43,38 @@ func (s *Store) Import(ctx context.Context, rec ImportRecord) (ImportOutcome, er
 		return ImportSkipped, nil
 	}
 	return ImportCreated, nil
+}
+
+// ImportBatch inserts many records in a single pipelined round trip
+// (pgx.Batch): the dominant cost of a bulk import against a remote
+// Postgres is per-row RTT, and this collapses len(recs) round trips
+// into one. Semantics match Import (ON CONFLICT (email) DO NOTHING).
+// The batch runs in one implicit transaction, so on error nothing from
+// this batch is committed; the caller should fall back to row-by-row
+// Import to isolate the bad record. Returns the number created;
+// skipped = len(recs) - created.
+func (s *Store) ImportBatch(ctx context.Context, recs []ImportRecord) (created int, err error) {
+	b := &pgx.Batch{}
+	for _, rec := range recs {
+		b.Queue(
+			`INSERT INTO users (id, email, email_verified, password_hash, name)
+			 VALUES ($1, $2, $3, $4, $5)
+			 ON CONFLICT (email) DO NOTHING`,
+			crypto.UUIDv7(), rec.Email, rec.EmailVerified, rec.PasswordHash, rec.Name)
+	}
+	br := s.pool.SendBatch(ctx, b)
+	defer br.Close()
+	for range recs {
+		tag, err := br.Exec()
+		if err != nil {
+			return 0, err
+		}
+		if tag.RowsAffected() > 0 {
+			created++
+		}
+	}
+	if err := br.Close(); err != nil {
+		return 0, err
+	}
+	return created, nil
 }

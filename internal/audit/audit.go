@@ -101,3 +101,18 @@ func (l *Logger) Record(ctx context.Context, event Event, actorUser, ip string, 
 	}
 	return nil
 }
+
+// PurgeOlderThan deletes audit rows older than retention and returns
+// the count removed. Retention is an operator decision
+// (SESAMO_AUDIT_RETENTION_DAYS); callers must not invoke this with a
+// non-positive retention — keep-forever is expressed by not calling it.
+// Intended to be called from a periodic job; uses ix_audit_occurred.
+func (l *Logger) PurgeOlderThan(ctx context.Context, retention time.Duration) (int64, error) {
+	tag, err := l.pool.Exec(ctx,
+		`DELETE FROM audit_log WHERE occurred_at < now() - make_interval(secs => $1)`,
+		retention.Seconds())
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}

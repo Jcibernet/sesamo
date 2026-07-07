@@ -41,6 +41,13 @@ type Config struct {
 	// of the auth path wins; enable for compliance-grade deployments.
 	AuditStrict bool
 
+	// AuditRetention bounds audit_log growth: rows older than this are
+	// deleted by the hourly maintenance job. Zero (default) keeps the
+	// audit log forever — retention is a compliance decision the
+	// operator must make explicitly, so we never silently destroy
+	// evidence.
+	AuditRetention time.Duration
+
 	Google OAuthProviderConfig
 	GitHub OAuthProviderConfig
 	Apple  AppleConfig
@@ -130,6 +137,9 @@ func Load() (*Config, error) {
 	c.SessionLifetime = time.Duration(days) * 24 * time.Hour
 	mins := getint("SESAMO_ROLLING_RENEWAL_THRESHOLD_MINUTES", 15)
 	c.RollingRenewalThreshold = time.Duration(mins) * time.Minute
+	if rd := getint("SESAMO_AUDIT_RETENTION_DAYS", 0); rd > 0 {
+		c.AuditRetention = time.Duration(rd) * 24 * time.Hour
+	}
 
 	if err := c.Brand.validate(); err != nil {
 		return nil, err

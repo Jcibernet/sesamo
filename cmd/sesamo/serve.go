@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/jcibernet/sesamo/internal/audit"
 	"github.com/jcibernet/sesamo/internal/config"
 	"github.com/jcibernet/sesamo/internal/db"
 	"github.com/jcibernet/sesamo/internal/email"
@@ -51,9 +52,10 @@ func serve(ctx context.Context, cfg *config.Config, pool *db.Pool, log *slog.Log
 const maintenanceInterval = time.Hour
 
 // runMaintenance periodically deletes rows that can no longer affect
-// behavior: expired sessions, dead one-time tokens, and rate-limit
-// buckets that have fully refilled. Unbounded growth of any of these is
-// a denial-of-service vector (disk, index bloat) — see THREAT_MODEL.md.
+// behavior: expired sessions, dead one-time tokens, rate-limit buckets
+// that have fully refilled, and (only when SESAMO_AUDIT_RETENTION_DAYS
+// is set) audit rows past retention. Unbounded growth of any of these
+// is a denial-of-service vector (disk, index bloat) — see THREAT_MODEL.md.
 func runMaintenance(ctx context.Context, cfg *config.Config, pool *db.Pool, log *slog.Logger) {
 	sessions := session.NewStore(pool, session.Config{
 		Lifetime:                cfg.SessionLifetime,
@@ -61,6 +63,7 @@ func runMaintenance(ctx context.Context, cfg *config.Config, pool *db.Pool, log 
 	})
 	tokens := email.NewTokenStore(pool)
 	limiter := ratelimit.New(pool)
+	auditor := audit.New(pool, log, cfg.AuditStrict)
 
 	t := time.NewTicker(maintenanceInterval)
 	defer t.Stop()
@@ -78,9 +81,16 @@ func runMaintenance(ctx context.Context, cfg *config.Config, pool *db.Pool, log 
 		if err != nil {
 			log.Warn("purge rate limit buckets", "err", err)
 		}
+		var na int64
+		if cfg.AuditRetention > 0 {
+			na, err = auditor.PurgeOlderThan(mctx, cfg.AuditRetention)
+			if err != nil {
+				log.Warn("purge audit log", "err", err)
+			}
+		}
 		cancel()
-		if ns+nt+nb > 0 {
-			log.Info("maintenance purge", "sessions", ns, "tokens", nt, "buckets", nb)
+		if ns+nt+nb+na > 0 {
+			log.Info("maintenance purge", "sessions", ns, "tokens", nt, "buckets", nb, "audit", na)
 		}
 		select {
 		case <-ctx.Done():
