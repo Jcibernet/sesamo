@@ -23,6 +23,19 @@ type Config struct {
 	// worse than one that refuses to.
 	Env string
 
+	// ProjectSlug names the consuming project this deployment serves —
+	// one Sésamo deployment == one project (docs/adr/0001). Deployment
+	// identity for the descriptor, CLI and logs; never an authorization
+	// boundary and never accepted from a request.
+	ProjectSlug string
+	// ProjectDisplayName is the human-facing project name surfaced by
+	// the descriptor.
+	ProjectDisplayName string
+
+	// Version is the build version stamped into the binary at link time
+	// and threaded in by main — not an environment variable.
+	Version string
+
 	DatabaseURL string
 	BaseURL     string
 	ListenAddr  string
@@ -84,6 +97,15 @@ type Config struct {
 	EmailProvider string
 	EmailFrom     string
 	EmailAPIKey   string
+	// EmailOutboxKeys is the AES-256-GCM keyring that encrypts queued
+	// email payloads (which embed bearer links) at rest:
+	// "<active-id>:<base64-32-bytes>[,<old-id>:<key>...]". The first key
+	// encrypts; the rest only decrypt, enabling overlapped rotation.
+	// Parsed and validated by internal/email at boot.
+	EmailOutboxKeys string
+	// ResendWebhookSecret is the svix signing secret ("whsec_...") for
+	// Resend delivery webhooks. Empty disables the webhook endpoint.
+	ResendWebhookSecret string
 
 	ThemeCSSURL string
 	Brand       BrandConfig
@@ -153,21 +175,25 @@ func (a AppleConfig) Enabled() bool {
 // validating that required fields are present.
 func Load() (*Config, error) {
 	c := &Config{
-		Env:           getenv("SESAMO_ENV", EnvDevelopment),
-		DatabaseURL:   getenv("SESAMO_DATABASE_URL", ""),
-		BaseURL:       getenv("SESAMO_BASE_URL", "http://localhost:7777"),
-		ListenAddr:    getenv("SESAMO_LISTEN_ADDR", ":7777"),
-		CookieName:    getenv("SESAMO_COOKIE_NAME", "sid"),
-		CookieSecure:  getbool("SESAMO_COOKIE_SECURE", false),
-		CookieDomain:  getenv("SESAMO_COOKIE_DOMAIN", ""),
-		ServiceToken:  getenv("SESAMO_SERVICE_TOKEN", ""),
-		AdminAPIKey:   getenv("SESAMO_ADMIN_API_KEY", ""),
-		TrustProxy:    getbool("SESAMO_TRUST_PROXY", false),
-		AuditStrict:   getbool("SESAMO_AUDIT_STRICT", false),
-		EmailProvider: getenv("SESAMO_EMAIL_PROVIDER", "log"),
-		EmailFrom:     getenv("SESAMO_EMAIL_FROM", "auth@localhost"),
-		EmailAPIKey:   getenv("SESAMO_EMAIL_API_KEY", ""),
-		ThemeCSSURL:   getenv("SESAMO_THEME_CSS_URL", ""),
+		Env:                 getenv("SESAMO_ENV", EnvDevelopment),
+		ProjectSlug:         getenv("SESAMO_PROJECT_SLUG", "sesamo"),
+		ProjectDisplayName:  getenv("SESAMO_PROJECT_DISPLAY_NAME", "Sésamo"),
+		DatabaseURL:         getenv("SESAMO_DATABASE_URL", ""),
+		BaseURL:             getenv("SESAMO_BASE_URL", "http://localhost:7777"),
+		ListenAddr:          getenv("SESAMO_LISTEN_ADDR", ":7777"),
+		CookieName:          getenv("SESAMO_COOKIE_NAME", "sid"),
+		CookieSecure:        getbool("SESAMO_COOKIE_SECURE", false),
+		CookieDomain:        getenv("SESAMO_COOKIE_DOMAIN", ""),
+		ServiceToken:        getenv("SESAMO_SERVICE_TOKEN", ""),
+		AdminAPIKey:         getenv("SESAMO_ADMIN_API_KEY", ""),
+		TrustProxy:          getbool("SESAMO_TRUST_PROXY", false),
+		AuditStrict:         getbool("SESAMO_AUDIT_STRICT", false),
+		EmailProvider:       getenv("SESAMO_EMAIL_PROVIDER", "log"),
+		EmailFrom:           getenv("SESAMO_EMAIL_FROM", "auth@localhost"),
+		EmailAPIKey:         getenv("SESAMO_EMAIL_API_KEY", ""),
+		EmailOutboxKeys:     getenv("SESAMO_EMAIL_OUTBOX_KEYS", ""),
+		ResendWebhookSecret: getenv("SESAMO_RESEND_WEBHOOK_SECRET", ""),
+		ThemeCSSURL:         getenv("SESAMO_THEME_CSS_URL", ""),
 		Brand: BrandConfig{
 			LogoURL:      getenv("SESAMO_BRAND_LOGO_URL", ""),
 			PrimaryColor: getenv("SESAMO_BRAND_PRIMARY_COLOR", ""),
@@ -242,6 +268,12 @@ func Load() (*Config, error) {
 			SignupPublic, SignupDisabled, c.Signup)
 	}
 
+	if !projectSlugRe.MatchString(c.ProjectSlug) {
+		return nil, fmt.Errorf(
+			"SESAMO_PROJECT_SLUG: must be a lowercase DNS-label-like slug ([a-z0-9-], 1-64 chars, no leading/trailing hyphen), got %q",
+			c.ProjectSlug)
+	}
+
 	if err := c.Brand.validate(); err != nil {
 		return nil, err
 	}
@@ -290,6 +322,11 @@ func parseRedirectOrigins(raw string) ([]string, error) {
 	}
 	return origins, nil
 }
+
+// projectSlugRe accepts lowercase DNS-label-like slugs. The slug lands
+// in the public descriptor and in logs, so it is validated at boot in
+// every environment — a broken identity should be loud.
+var projectSlugRe = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$`)
 
 // envField pairs an env var name with its resolved value so error
 // messages can name the variable the operator has to fix.
@@ -343,6 +380,10 @@ func (c *Config) validateProduction(intErrs []error) []error {
 	if c.EmailFrom == "" || strings.Contains(strings.ToLower(c.EmailFrom), "localhost") {
 		probs = append(probs, fmt.Errorf(
 			"SESAMO_EMAIL_FROM: must be a deliverable sender address in production, got %q", c.EmailFrom))
+	}
+	if c.EmailOutboxKeys == "" {
+		probs = append(probs, errors.New(
+			"SESAMO_EMAIL_OUTBOX_KEYS: required in production (queued email payloads embed bearer links and are encrypted at rest; see .env.example)"))
 	}
 
 	probs = appendNonNil(probs,

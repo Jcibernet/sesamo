@@ -30,6 +30,25 @@ const (
 	codeCSRFFailed         = "csrf_failed"
 )
 
+// stableErrorCodes is the published catalog of error codes, in the order
+// the descriptor exposes it. It is built from the constants above rather
+// than re-typed as literals, because the descriptor
+// (GET /.well-known/sesamo) and `sesamo describe` derive their "errors"
+// array from this slice: a hand-authored catalog drifts silently the
+// first time a code is renamed. Adding a new code means adding it here.
+var stableErrorCodes = []string{
+	codeInvalidCredentials,
+	codeInvalidRequest,
+	codeRateLimited,
+	codeUnauthorized,
+	codeForbidden,
+	codeNotFound,
+	codeInternal,
+	codeStateMismatch,
+	codeOAuthFailed,
+	codeCSRFFailed,
+}
+
 // writeError emits a JSON apiError with the given status and code.
 func writeError(w http.ResponseWriter, status int, code, message string) {
 	var e apiError

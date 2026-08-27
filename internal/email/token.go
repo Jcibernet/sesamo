@@ -35,32 +35,50 @@ func NewTokenStore(pool *pgxpool.Pool) *TokenStore {
 // unconsumed tokens of the same purpose for that user are invalidated so
 // only the newest link works.
 func (s *TokenStore) Issue(ctx context.Context, userID string, purpose Purpose, ttl time.Duration) (string, error) {
-	token := crypto.GenerateToken()
-	hash := crypto.HashToken(token)
-	now := time.Now().UTC()
-
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return "", err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	if _, err := tx.Exec(ctx,
-		`UPDATE one_time_tokens SET consumed_at = $3
-		 WHERE user_id = $1 AND purpose = $2 AND consumed_at IS NULL`,
-		userID, string(purpose), now); err != nil {
-		return "", err
-	}
-	if _, err := tx.Exec(ctx,
-		`INSERT INTO one_time_tokens (id, user_id, token_hash, purpose, expires_at)
-		 VALUES ($1, $2, $3, $4, $5)`,
-		crypto.UUIDv7(), userID, hash, string(purpose), now.Add(ttl)); err != nil {
+	token, _, err := s.IssueTx(ctx, tx, userID, purpose, ttl)
+	if err != nil {
 		return "", err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return "", err
 	}
 	return token, nil
+}
+
+// IssueTx is Issue inside a caller-owned transaction, so minting the
+// token, queueing the email that carries it, and recording the evidence
+// commit or roll back together — no token for an email that was never
+// queued, and no queued link pointing at a token that does not exist.
+//
+// It also returns the row id, which the outbox stores: the worker
+// re-checks that the link is still live before handing it to a provider.
+func (s *TokenStore) IssueTx(ctx context.Context, tx pgx.Tx, userID string, purpose Purpose, ttl time.Duration) (token, tokenID string, err error) {
+	token = crypto.GenerateToken()
+	hash := crypto.HashToken(token)
+	now := time.Now().UTC()
+
+	// Supersede prior links of the same purpose: only the newest one
+	// works. Outbox.QueueTx cancels their still-pending jobs.
+	if _, err := tx.Exec(ctx,
+		`UPDATE one_time_tokens SET consumed_at = $3
+		 WHERE user_id = $1 AND purpose = $2 AND consumed_at IS NULL`,
+		userID, string(purpose), now); err != nil {
+		return "", "", err
+	}
+	tokenID = crypto.UUIDv7()
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO one_time_tokens (id, user_id, token_hash, purpose, expires_at)
+		 VALUES ($1, $2, $3, $4, $5)`,
+		tokenID, userID, hash, string(purpose), now.Add(ttl)); err != nil {
+		return "", "", err
+	}
+	return token, tokenID, nil
 }
 
 // ErrInvalidToken is returned when a token is missing, expired, or used.

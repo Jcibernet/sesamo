@@ -111,6 +111,18 @@ curl -s -XPOST -H "Authorization: Bearer $SESAMO_SERVICE_TOKEN" \
 | `GET` | `/readyz` | Readiness (pings Postgres) |
 | `GET` | `/metrics` | Prometheus exposition |
 
+### Discovery (public, read-only, no secrets)
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/.well-known/sesamo` | Machine-readable deployment descriptor: project identity, endpoint map, enabled capabilities, session contract, stable error codes. Derived from the same constants the handlers use — `sesamo describe` prints the same JSON offline |
+| `GET` | `/openapi.json` | OpenAPI 3.1 contract for the HTTP surface |
+| `GET` | `/llms.txt` | Short integration guide for AI agents |
+
+### Webhooks (signature-verified)
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/v1/webhooks/resend` | Resend delivery events (delivered / bounced / complained / failed) for queued email; svix-signed with `SESAMO_RESEND_WEBHOOK_SECRET`, replay-deduplicated. 503 when the secret is unset |
+
 ## Reference clients
 
 Minimal, SDK-free integrations live in [`examples/`](./examples):
@@ -139,6 +151,8 @@ library. See [`.env.example`](./.env.example) for the full annotated list.
 | Variable | Default | Notes |
 |---|---|---|
 | `SESAMO_ENV` | `development` | `development` keeps local defaults. `production` fails boot unless HTTPS, secure cookie, two distinct 32+ character secrets, real email credentials, explicit encrypted DB SSL mode, valid durations, and complete-or-empty OAuth blocks are present |
+| `SESAMO_PROJECT_SLUG` | `sesamo` | Deployment identity: one Sésamo deployment serves one consuming project (see `docs/adr/0001`). Lowercase slug, surfaced by the descriptor and `sesamo describe`; never an authorization boundary |
+| `SESAMO_PROJECT_DISPLAY_NAME` | `Sésamo` | Human-facing project name in the descriptor |
 | `SESAMO_DATABASE_URL` | _(required)_ | Postgres DSN. Pool tuning goes in the DSN via pgx params — e.g. `?pool_max_conns=10&pool_min_conns=2`. Defaults: max conns = `max(4, NumCPU)`, conn lifetime 1 h, idle timeout 30 min. Production requires explicit `sslmode=require`, `verify-ca`, or `verify-full` |
 | `SESAMO_BASE_URL` | `http://localhost:7777` | Public URL (cookies, OAuth redirects); production requires `https://` |
 | `SESAMO_LISTEN_ADDR` | `:7777` | HTTP listen address |
@@ -156,6 +170,8 @@ library. See [`.env.example`](./.env.example) for the full annotated list.
 | `SESAMO_SIGNUP` | `public` | `public` or `disabled`. Disabled: `/signup` refuses new accounts and OAuth refuses identities that would create one; existing users keep logging in |
 | `SESAMO_{GOOGLE,GITHUB,APPLE}_*` | — | OAuth provider credentials; production accepts each provider block only complete or empty |
 | `SESAMO_EMAIL_PROVIDER` | `log` | `log` / `resend` / `postmark`; production requires `resend` or `postmark` plus API key and deliverable From address |
+| `SESAMO_EMAIL_OUTBOX_KEYS` | _(dev: ephemeral)_ | AES-256-GCM keyring encrypting queued email payloads (they embed one-time bearer links): `id:base64-32-bytes[,old:key]`. First key encrypts, the rest decrypt (overlapped rotation). Required in production |
+| `SESAMO_RESEND_WEBHOOK_SECRET` | _(empty: webhook off)_ | Svix signing secret for `POST /v1/webhooks/resend` delivery events |
 | `SESAMO_THEME_CSS_URL` | — | Full override stylesheet (see Theming) |
 | `SESAMO_BRAND_LOGO_URL` | — | Logo atop the login card (SVG recommended; host is added to CSP `img-src`) |
 | `SESAMO_BRAND_PRIMARY_COLOR` | — | Primary/button/link color, any CSS color |

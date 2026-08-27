@@ -27,15 +27,19 @@ const (
 
 // serve wires the HTTP handler and runs the server until ctx is done.
 func serve(ctx context.Context, cfg *config.Config, pool *db.Pool, log *slog.Logger) error {
-	handler, err := httpapi.NewServer(cfg, pool, log)
+	api, err := httpapi.NewServer(cfg, pool, log)
 	if err != nil {
 		return err
 	}
-	go runMaintenance(ctx, cfg, pool, log)
+	// The email worker runs in-process, one per replica: jobs are
+	// partitioned by lease, so scaling replicas scales delivery without
+	// duplicating mail. It shares the server's outbox and metrics.
+	go api.EmailWorker().Run(ctx)
+	go runMaintenance(ctx, cfg, pool, log, api.EmailOutbox())
 
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           handler,
+		Handler:           api,
 		ReadHeaderTimeout: serverReadHeaderTimeout,
 		ReadTimeout:       serverReadTimeout,
 		WriteTimeout:      serverWriteTimeout,
@@ -66,12 +70,19 @@ func serve(ctx context.Context, cfg *config.Config, pool *db.Pool, log *slog.Log
 // measurable load.
 const maintenanceInterval = time.Hour
 
+// outboxRetention is how long a finished email job (and its delivery
+// events) survives. This table is an execution log, not evidence:
+// audit_log keeps the business record of a reset or a magic link, so a
+// short window is enough to diagnose a delivery incident.
+const outboxRetention = 7 * 24 * time.Hour
+
 // runMaintenance periodically deletes rows that can no longer affect
 // behavior: expired sessions, dead one-time tokens, rate-limit buckets
-// that have fully refilled, and (only when SESAMO_AUDIT_RETENTION_DAYS
-// is set) audit rows past retention. Unbounded growth of any of these
-// is a denial-of-service vector (disk, index bloat) — see THREAT_MODEL.md.
-func runMaintenance(ctx context.Context, cfg *config.Config, pool *db.Pool, log *slog.Logger) {
+// that have fully refilled, finished email-outbox jobs past retention,
+// and (only when SESAMO_AUDIT_RETENTION_DAYS is set) audit rows past
+// retention. Unbounded growth of any of these is a denial-of-service
+// vector (disk, index bloat) — see THREAT_MODEL.md.
+func runMaintenance(ctx context.Context, cfg *config.Config, pool *db.Pool, log *slog.Logger, outbox *email.Outbox) {
 	sessions := session.NewStore(pool, session.Config{
 		Lifetime:                cfg.SessionLifetime,
 		RollingRenewalThreshold: cfg.RollingRenewalThreshold,
@@ -104,9 +115,14 @@ func runMaintenance(ctx context.Context, cfg *config.Config, pool *db.Pool, log 
 				log.Warn("purge audit log", "err", err)
 			}
 		}
+		no, err := outbox.PurgeFinished(mctx, outboxRetention)
+		if err != nil {
+			log.Warn("purge email outbox", "err", err)
+		}
 		cancel()
-		if ns+nt+nb+na > 0 {
-			log.Info("maintenance purge", "sessions", ns, "tokens", nt, "buckets", nb, "audit", na)
+		if ns+nt+nb+na+no > 0 {
+			log.Info("maintenance purge", "sessions", ns, "tokens", nt, "buckets", nb,
+				"audit", na, "email_outbox", no)
 		}
 		select {
 		case <-ctx.Done():
