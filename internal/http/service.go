@@ -32,7 +32,7 @@ type introspectResponse struct {
 // path; it must be a single indexed lookup (Step 9 load test target:
 // p50<5ms, p99<20ms).
 func (s *Server) handleIntrospect(w http.ResponseWriter, r *http.Request) {
-	token := introspectToken(r)
+	token := s.introspectToken(r)
 	if token == "" {
 		writeJSON(w, http.StatusOK, introspectResponse{Active: false})
 		return
@@ -67,7 +67,7 @@ func (s *Server) handleIntrospect(w http.ResponseWriter, r *http.Request) {
 
 // handleSessionRevoke lets a backend force-logout a session by token.
 func (s *Server) handleSessionRevoke(w http.ResponseWriter, r *http.Request) {
-	token := introspectToken(r)
+	token := s.introspectToken(r)
 	if token == "" {
 		writeError(w, http.StatusBadRequest, codeInvalidRequest, "Falta el token de sesión.")
 		return
@@ -85,13 +85,13 @@ func (s *Server) handleSessionRevoke(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "revoked"})
 }
 
-// introspectToken pulls the session token from the JSON/form body field
-// "token" or, failing that, a sesamo session cookie forwarded by a gateway.
-func introspectToken(r *http.Request) string {
+// introspectToken pulls the session token from the form body field "token" or,
+// failing that, the configured session cookie forwarded by a gateway.
+func (s *Server) introspectToken(r *http.Request) string {
 	if t := strings.TrimSpace(r.FormValue("token")); t != "" {
 		return t
 	}
-	if c, err := r.Cookie("sid"); err == nil {
+	if c, err := r.Cookie(s.cfg.CookieName); err == nil {
 		return c.Value
 	}
 	return ""

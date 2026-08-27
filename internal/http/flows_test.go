@@ -7,6 +7,8 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+
+	"github.com/jcibernet/sesamo/internal/config"
 )
 
 // This file exercises the browser (HTML) flow that content-negotiates
@@ -234,5 +236,210 @@ func TestFlow06_LoginPageMagicLinkWiringAndCSP(t *testing.T) {
 	}
 	if strings.Contains(body, `style="`) {
 		t.Fatalf("GET /login: inline style attribute violates CSP, body: %s", body)
+	}
+}
+
+// newRedirectHarness boots the server with a consuming app allowlisted,
+// mirroring the Marketmaker deployment (SPA on another local origin).
+func newRedirectHarness(t *testing.T) *harness {
+	return newHarnessWithConfig(t, func(cfg *config.Config) {
+		cfg.RedirectOrigins = []string{"http://127.0.0.1:8010"}
+	})
+}
+
+// ── Flow 6: password login round-trips to the consuming app. GET /login
+// captures redirect_to; the form POST lands the browser back on the
+// exact allowlisted path+query it came from ───────────────────────────
+func TestFlow07_PasswordLoginRoundTripsRedirect(t *testing.T) {
+	h := newRedirectHarness(t)
+	emailAddr := uniqueEmail("flowredirect")
+	h.signup(emailAddr, "correct-horse-flow6")
+	c := h.client()
+
+	target := "http://127.0.0.1:8010/paper?x=1"
+	res, _ := browserGet(t, c, h.srv.URL+"/login?redirect_to="+url.QueryEscape(target))
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("GET /login: expected 200, got %d", res.StatusCode)
+	}
+
+	pres, _ := browserPostForm(t, c, h.srv.URL+"/login", url.Values{
+		"email": {emailAddr}, "password": {"correct-horse-flow6"},
+	})
+	if pres.StatusCode != http.StatusFound {
+		t.Fatalf("POST /login: expected 302, got %d", pres.StatusCode)
+	}
+	if loc := pres.Header.Get("Location"); loc != target {
+		t.Fatalf("POST /login: expected redirect to %q, got %q", target, loc)
+	}
+	// The one-shot destination must not survive the login that used it.
+	for _, ck := range pres.Cookies() {
+		if ck.Name == cookiePostLogin && ck.MaxAge >= 0 {
+			t.Fatalf("post-login cookie must be cleared after use, got MaxAge=%d", ck.MaxAge)
+		}
+	}
+}
+
+// ── Flow 7: a login without any captured destination keeps the
+// pre-existing behavior and lands on "/" ──────────────────────────────
+func TestFlow08_PasswordLoginWithoutRedirectLandsOnRoot(t *testing.T) {
+	h := newRedirectHarness(t)
+	emailAddr := uniqueEmail("flownoredirect")
+	h.signup(emailAddr, "correct-horse-flow7")
+	c := h.client()
+
+	pres, _ := browserPostForm(t, c, h.srv.URL+"/login", url.Values{
+		"email": {emailAddr}, "password": {"correct-horse-flow7"},
+	})
+	if pres.StatusCode != http.StatusFound {
+		t.Fatalf("POST /login: expected 302, got %d", pres.StatusCode)
+	}
+	if loc := pres.Header.Get("Location"); loc != "/" {
+		t.Fatalf("POST /login: expected redirect to /, got %q", loc)
+	}
+}
+
+// ── Flow 8: a hostile redirect_to (unlisted origin, protocol-relative)
+// is neutralized at capture time and the login lands on "/" ───────────
+func TestFlow09_HostileRedirectTargetsCollapse(t *testing.T) {
+	h := newRedirectHarness(t)
+	emailAddr := uniqueEmail("flowhostile")
+	h.signup(emailAddr, "correct-horse-flow8")
+
+	for _, hostile := range []string{
+		"https://evil.com/phish",
+		"//evil.com/phish",
+		"http://127.0.0.1:9999/paper",
+		"http://127.0.0.1:8010@evil.com/",
+	} {
+		c := h.client()
+		browserGet(t, c, h.srv.URL+"/login?redirect_to="+url.QueryEscape(hostile))
+		pres, _ := browserPostForm(t, c, h.srv.URL+"/login", url.Values{
+			"email": {emailAddr}, "password": {"correct-horse-flow8"},
+		})
+		if pres.StatusCode != http.StatusFound {
+			t.Fatalf("POST /login (%q): expected 302, got %d", hostile, pres.StatusCode)
+		}
+		if loc := pres.Header.Get("Location"); loc != "/" {
+			t.Fatalf("POST /login (%q): expected redirect to /, got %q", hostile, loc)
+		}
+	}
+}
+
+// ── Flow 9: the magic-link confirm inherits the destination captured at
+// GET /login — the emailed link itself never carries a redirect ───────
+func TestFlow10_MagicLinkPreservesRedirect(t *testing.T) {
+	h := newRedirectHarness(t)
+	emailAddr := uniqueEmail("flowmagic")
+	h.signup(emailAddr, "correct-horse-flow9")
+
+	var userID string
+	if err := h.pool.QueryRow(context.Background(),
+		`SELECT id FROM users WHERE email = $1`, emailAddr).Scan(&userID); err != nil {
+		t.Fatal(err)
+	}
+	tok, err := issueRawMagicLinkToken(h.pool, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	target := "http://127.0.0.1:8010/paper"
+	c := h.client()
+	browserGet(t, c, h.srv.URL+"/login?redirect_to="+url.QueryEscape(target))
+
+	res, _ := browserGet(t, c, h.srv.URL+"/magiclink/confirm?token="+tok)
+	if res.StatusCode != http.StatusFound {
+		t.Fatalf("GET /magiclink/confirm: expected 302, got %d", res.StatusCode)
+	}
+	if loc := res.Header.Get("Location"); loc != target {
+		t.Fatalf("GET /magiclink/confirm: expected redirect to %q, got %q", target, loc)
+	}
+}
+
+// ── Flow 10: logout accepts an allowlisted redirect_to and rejects an
+// unlisted one, so a consuming app can land its own signed-out page ───
+func TestFlow11_LogoutRedirectsToAllowlistedTarget(t *testing.T) {
+	h := newRedirectHarness(t)
+	emailAddr := uniqueEmail("flowlogout")
+	h.signup(emailAddr, "correct-horse-flow10")
+	c := h.client()
+
+	browserPostForm(t, c, h.srv.URL+"/login", url.Values{
+		"email": {emailAddr}, "password": {"correct-horse-flow10"},
+	})
+
+	target := "http://127.0.0.1:8010/signed-out"
+	res, _ := browserPostForm(t, c, h.srv.URL+"/logout", url.Values{"redirect_to": {target}})
+	if res.StatusCode != http.StatusFound {
+		t.Fatalf("POST /logout: expected 302, got %d", res.StatusCode)
+	}
+	if loc := res.Header.Get("Location"); loc != target {
+		t.Fatalf("POST /logout: expected redirect to %q, got %q", target, loc)
+	}
+
+	res2, _ := browserPostForm(t, c, h.srv.URL+"/logout", url.Values{"redirect_to": {"https://evil.com/"}})
+	if loc := res2.Header.Get("Location"); loc != "/" {
+		t.Fatalf("POST /logout hostile: expected redirect to /, got %q", loc)
+	}
+}
+
+// ── Flow 12: SESAMO_SIGNUP=disabled refuses new accounts with one
+// stable response while existing users keep logging in ────────────────
+func TestFlow12_SignupDisabled(t *testing.T) {
+	// The existing account is created while signup is still public…
+	h := newHarnessWithConfig(t, func(cfg *config.Config) {
+		cfg.Signup = config.SignupDisabled
+		cfg.RedirectOrigins = []string{"http://127.0.0.1:8010"}
+	})
+	emailAddr := uniqueEmail("flowsignupoff")
+	var userID string
+	if err := h.pool.QueryRow(context.Background(),
+		`INSERT INTO users (id, email, email_verified) VALUES (gen_random_uuid(), $1, true) RETURNING id`,
+		emailAddr).Scan(&userID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = h.pool.Exec(context.Background(), `DELETE FROM users WHERE id = $1`, userID)
+	})
+
+	c := h.client()
+	newEmail := uniqueEmail("flowsignupnew")
+	res, body := h.postJSON(c, "/signup", url.Values{
+		"email": {newEmail}, "password": {"long-enough-password"},
+	})
+	if res.StatusCode != http.StatusForbidden {
+		t.Fatalf("POST /signup disabled: expected 403, got %d (%s)", res.StatusCode, body)
+	}
+	if !strings.Contains(body, "forbidden") {
+		t.Fatalf("POST /signup disabled: expected stable forbidden code, got %s", body)
+	}
+
+	// Anti-enumeration under disabled: the refusal for an EXISTING email
+	// must be byte-identical to the refusal for an unknown one — the
+	// branch runs before any lookup, and this pins it.
+	eres, ebody := h.postJSON(c, "/signup", url.Values{
+		"email": {emailAddr}, "password": {"long-enough-password"},
+	})
+	if eres.StatusCode != res.StatusCode || ebody != body {
+		t.Fatalf("disabled signup must not distinguish existing accounts: %d %q vs %d %q",
+			eres.StatusCode, ebody, res.StatusCode, body)
+	}
+
+	var count int
+	if err := h.pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM users WHERE email = $1`, newEmail).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("disabled signup must not create users, found %d rows", count)
+	}
+
+	// An existing account still logs in (via magic link — no password set).
+	tok, err := issueRawMagicLinkToken(h.pool, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lres, _ := browserGet(t, c, h.srv.URL+"/magiclink/confirm?token="+tok)
+	if lres.StatusCode != http.StatusFound {
+		t.Fatalf("magic link under disabled signup: expected 302, got %d", lres.StatusCode)
 	}
 }

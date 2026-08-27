@@ -48,6 +48,21 @@ type Config struct {
 	// evidence.
 	AuditRetention time.Duration
 
+	// RedirectOrigins is the exact-match allowlist of external origins a
+	// post-login/post-logout redirect may target. Empty (default) keeps
+	// the pre-existing behavior: only internal paths are honored. Origins
+	// are compared as literal scheme://host[:port] strings — no wildcard,
+	// no subdomain inference, no default-port equivalence. That rigidity
+	// is the point: an open redirect on an auth server converts every
+	// phishing email into a credible login link.
+	RedirectOrigins []string
+
+	// Signup selects the registration policy: SignupPublic (default,
+	// current behavior) or SignupDisabled — POST /signup creates nothing
+	// and OAuth login refuses to create a brand-new account while still
+	// admitting identities that resolve to an existing user.
+	Signup string
+
 	Google OAuthProviderConfig
 	GitHub OAuthProviderConfig
 	Apple  AppleConfig
@@ -61,6 +76,12 @@ type Config struct {
 
 	OIDCEnabled bool
 }
+
+// Signup policy values for Config.Signup.
+const (
+	SignupPublic   = "public"
+	SignupDisabled = "disabled"
+)
 
 // OAuthProviderConfig holds the standard client_id/secret/redirect set.
 type OAuthProviderConfig struct {
@@ -114,6 +135,7 @@ func Load() (*Config, error) {
 			FontURL:      getenv("SESAMO_BRAND_FONT_URL", ""),
 		},
 		OIDCEnabled: getbool("SESAMO_OIDC_ENABLED", false),
+		Signup:      getenv("SESAMO_SIGNUP", SignupPublic),
 		Google: OAuthProviderConfig{
 			ClientID:     getenv("SESAMO_GOOGLE_CLIENT_ID", ""),
 			ClientSecret: getenv("SESAMO_GOOGLE_CLIENT_SECRET", ""),
@@ -141,6 +163,17 @@ func Load() (*Config, error) {
 		c.AuditRetention = time.Duration(rd) * 24 * time.Hour
 	}
 
+	origins, err := parseRedirectOrigins(os.Getenv("SESAMO_REDIRECT_ORIGINS"))
+	if err != nil {
+		return nil, err
+	}
+	c.RedirectOrigins = origins
+
+	if c.Signup != SignupPublic && c.Signup != SignupDisabled {
+		return nil, fmt.Errorf("SESAMO_SIGNUP: must be %q or %q, got %q",
+			SignupPublic, SignupDisabled, c.Signup)
+	}
+
 	if err := c.Brand.validate(); err != nil {
 		return nil, err
 	}
@@ -149,6 +182,31 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("SESAMO_DATABASE_URL is required")
 	}
 	return c, nil
+}
+
+// parseRedirectOrigins validates a comma-separated origin list. Each
+// entry must be a bare absolute http(s) origin — host required, no
+// userinfo, no path, no query, no fragment — and is normalized to
+// lowercase scheme://host[:port] (hosts are case-insensitive, RFC 3986).
+// Boot fails loudly on anything else: a silently
+// dropped origin would surface later as a mysterious redirect to "/".
+func parseRedirectOrigins(raw string) ([]string, error) {
+	var origins []string
+	for _, entry := range strings.Split(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		u, err := url.Parse(entry)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return nil, fmt.Errorf("SESAMO_REDIRECT_ORIGINS: %q must be an absolute http(s) origin", entry)
+		}
+		if u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
+			return nil, fmt.Errorf("SESAMO_REDIRECT_ORIGINS: %q must be a bare origin without path, query, fragment, or userinfo", entry)
+		}
+		origins = append(origins, u.Scheme+"://"+strings.ToLower(u.Host))
+	}
+	return origins, nil
 }
 
 func getenv(key, def string) string {

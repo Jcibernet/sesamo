@@ -80,15 +80,15 @@ curl -s -XPOST -H "Authorization: Bearer $SESAMO_SERVICE_TOKEN" \
 ### End-user (browser)
 | Method | Path | Purpose |
 |---|---|---|
-| `GET`  | `/login` | Login page (HTML, or JSON with `Accept: application/json`) |
-| `POST` | `/login` | Email + password login |
-| `POST` | `/signup` | Create account, send verification email |
-| `POST` | `/logout` | Revoke session (POST-only, anti-CSRF) |
-| `GET`  | `/auth/{provider}` | Start OAuth (`google` / `github` / `apple`) |
+| `GET`  | `/login` | Login page (HTML, or JSON with `Accept: application/json`). `?redirect_to=` captures the post-login destination: an internal path or an origin allowlisted in `SESAMO_REDIRECT_ORIGINS` |
+| `POST` | `/login` | Email + password login; returns to the captured/`redirect_to` destination |
+| `POST` | `/signup` | Create account, send verification email (`SESAMO_SIGNUP=disabled` refuses with a stable 403) |
+| `POST` | `/logout` | Revoke session (POST-only, anti-CSRF). Optional `redirect_to` form field, validated against the same allowlist |
+| `GET`  | `/auth/{provider}` | Start OAuth (`google` / `github` / `apple`); `?redirect_to=` captured like `/login` |
 | `GET`  | `/auth/{provider}/callback` | OAuth callback (state + PKCE checked) |
 | `POST` | `/reset` · `/reset/confirm` | Password reset request / confirm |
 | `GET`  | `/verify` | Confirm email verification token |
-| `POST` | `/magiclink` · `GET /magiclink/confirm` | Passwordless login |
+| `POST` | `/magiclink` · `GET /magiclink/confirm` | Passwordless login. A captured `redirect_to` survives only when confirmation happens in the same browser within 15 minutes |
 | `GET`  | `/ui/theme.css` | Embedded base stylesheet (design tokens) |
 
 ### Service-to-service (require `Authorization: Bearer $SESAMO_SERVICE_TOKEN`)
@@ -121,6 +121,15 @@ Minimal, SDK-free integrations live in [`examples/`](./examples):
 
 Both are ~30 lines and use nothing but the standard HTTP client.
 
+### Identity boundary
+
+Sésamo authenticates an identity; the consuming application owns authorization
+and its domain data. Treat introspection's `user_id` as the stable UUIDv7
+identity key and keep any local user mapping and ownership scope in the
+consuming application's database. Do not key that mapping by `email`, which is
+mutable. `metadata` is returned by introspection but has no HTTP write API.
+
+
 ## Configuration
 
 All configuration is environment variables — no config file, no config
@@ -140,6 +149,8 @@ library. See [`.env.example`](./.env.example) for the full annotated list.
 | `SESAMO_TRUST_PROXY` | `false` | Honor `X-Forwarded-For` for client IP (rate-limit keying, logs, audit). Enable ONLY behind a proxy that overwrites the header |
 | `SESAMO_AUDIT_STRICT` | `false` | Fail auth operations whose `audit_log` write fails (no evidence, no action). Default: best-effort — availability wins |
 | `SESAMO_AUDIT_RETENTION_DAYS` | `0` (keep forever) | When > 0, the hourly maintenance job deletes `audit_log` rows older than N days. Unset = unbounded growth; pick a retention before production |
+| `SESAMO_REDIRECT_ORIGINS` | _(empty)_ | Comma-separated exact-match allowlist of external origins `redirect_to` may target (e.g. `https://app.example.com`). Bare origins only. Empty keeps redirects internal-only |
+| `SESAMO_SIGNUP` | `public` | `public` or `disabled`. Disabled: `/signup` returns a stable 403 and OAuth login refuses to create brand-new accounts; existing users keep logging in |
 | `SESAMO_{GOOGLE,GITHUB,APPLE}_*` | — | OAuth provider credentials |
 | `SESAMO_EMAIL_PROVIDER` | `log` | `log` / `resend` / `postmark` |
 | `SESAMO_THEME_CSS_URL` | — | Full override stylesheet (see Theming) |

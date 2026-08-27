@@ -24,6 +24,13 @@ func issueRawResetToken(pool *pgxpool.Pool, userID string) (string, error) {
 	return ts.Issue(context.Background(), userID, email.PurposeReset, 15*time.Minute)
 }
 
+// issueRawMagicLinkToken mints a real magic-link token (returning the
+// raw value) so tests can exercise /magiclink/confirm without email.
+func issueRawMagicLinkToken(pool *pgxpool.Pool, userID string) (string, error) {
+	ts := email.NewTokenStore(pool)
+	return ts.Issue(context.Background(), userID, email.PurposeMagicLink, 15*time.Minute)
+}
+
 // resetRateLimits clears rate-limit buckets accumulated by prior test
 // runs. All httptest traffic originates from 127.0.0.1 and every test
 // identity lives under @test.local, so consecutive `go test` runs within

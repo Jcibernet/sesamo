@@ -36,11 +36,17 @@ type UpsertResult struct {
 	IsNew  bool
 }
 
+// ErrSignupDisabled is returned by UpsertByOAuth when resolving the
+// profile would require creating a brand-new user and the deployment's
+// signup policy forbids it. Identities that resolve to an existing user
+// (linked or matched by email) are unaffected.
+var ErrSignupDisabled = errors.New("signup disabled: new user creation is not allowed")
+
 // UpsertByOAuth resolves a user from an OAuth profile. It links by
 // (provider, provider_sub) first; if no identity exists it links to an
-// existing user by email, or creates a new user. Returns whether the
-// user account was newly created.
-func (s *Store) UpsertByOAuth(ctx context.Context, p OAuthProfile) (UpsertResult, error) {
+// existing user by email, or — only when allowCreate — creates a new
+// user. Returns whether the user account was newly created.
+func (s *Store) UpsertByOAuth(ctx context.Context, p OAuthProfile, allowCreate bool) (UpsertResult, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return UpsertResult{}, err
@@ -73,6 +79,9 @@ func (s *Store) UpsertByOAuth(ctx context.Context, p OAuthProfile) (UpsertResult
 	err = tx.QueryRow(ctx, `SELECT id FROM users WHERE email = $1`, p.Email).Scan(&userID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// 3. Create a new user.
+		if !allowCreate {
+			return UpsertResult{}, ErrSignupDisabled
+		}
 		userID = crypto.UUIDv7()
 		if _, err := tx.Exec(ctx,
 			`INSERT INTO users (id, email, email_verified, name, picture_url)

@@ -28,6 +28,7 @@ const (
 	LoginSuccess       Event = "login.success"
 	LoginFailed        Event = "login.failed"
 	Signup             Event = "signup"
+	SignupRejected     Event = "signup.rejected"
 	Logout             Event = "logout"
 	EmailVerified      Event = "email.verified"
 	ResetRequested     Event = "reset.requested"

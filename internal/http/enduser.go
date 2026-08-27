@@ -1,15 +1,18 @@
 package http
 
 import (
+	"errors"
 	"net/http"
 	"time"
 
 	"github.com/jcibernet/sesamo/internal/audit"
+	"github.com/jcibernet/sesamo/internal/config"
 	"github.com/jcibernet/sesamo/internal/crypto"
 	"github.com/jcibernet/sesamo/internal/email"
 	"github.com/jcibernet/sesamo/internal/oauth"
 	"github.com/jcibernet/sesamo/internal/session"
 	"github.com/jcibernet/sesamo/internal/ui"
+	"github.com/jcibernet/sesamo/internal/user"
 )
 
 func (s *Server) registerEndUser() {
@@ -34,6 +37,10 @@ func (s *Server) registerEndUser() {
 // available methods as JSON in headless mode (Accept: application/json or
 // ?mode=json) so a custom frontend can render its own UI.
 func (s *Server) handleLoginPage(w http.ResponseWriter, r *http.Request) {
+	// Remember where the consuming app wants the user back. Password and
+	// magic-link flows have no provider round trip to carry state, so the
+	// login page is where the destination enters the system.
+	s.captureRedirect(w, r)
 	if wantsJSON(r) {
 		payload := map[string]any{
 			"providers": s.providers.Names(),
@@ -119,9 +126,7 @@ func (s *Server) handleOAuthStart(w http.ResponseWriter, r *http.Request) {
 	s.setTransient(w, cookieOAuthState, state)
 	s.setTransient(w, cookiePKCE, pkce.Verifier)
 
-	if rt := r.URL.Query().Get("redirect_to"); rt != "" {
-		s.setTransient(w, cookiePostLogin, safeInternalPath(rt))
-	}
+	s.captureRedirect(w, r)
 
 	url := prov.AuthorizeURL(state, pkce.Verifier)
 	if wantsJSON(r) {
@@ -167,7 +172,15 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res, err := s.users.UpsertByOAuth(r.Context(), profile)
+	res, err := s.users.UpsertByOAuth(r.Context(), profile, s.cfg.Signup != config.SignupDisabled)
+	if errors.Is(err, user.ErrSignupDisabled) {
+		if !s.recordAudit(w, r, audit.SignupRejected, "",
+			map[string]any{"method": "oauth", "provider": name, "reason": "signup_disabled"}) {
+			return
+		}
+		s.oauthFail(w, r, codeForbidden, "El registro está deshabilitado.")
+		return
+	}
 	if err != nil {
 		s.log.Error("upsert oauth user", "err", err)
 		writeError(w, http.StatusInternalServerError, codeInternal, "Error interno.")
@@ -238,6 +251,16 @@ func (s *Server) handlePasswordLogin(w http.ResponseWriter, r *http.Request) {
 
 // handleSignup creates a password user and sends a verification email.
 func (s *Server) handleSignup(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.Signup == config.SignupDisabled {
+		// One stable response for every caller: the branch never touches
+		// the database, so it cannot leak whether an account exists.
+		if !s.recordAudit(w, r, audit.SignupRejected, "",
+			map[string]any{"method": "password", "reason": "signup_disabled"}) {
+			return
+		}
+		writeError(w, http.StatusForbidden, codeForbidden, "El registro está deshabilitado.")
+		return
+	}
 	emailAddr, password := r.FormValue("email"), r.FormValue("password")
 	if emailAddr == "" || len(password) < 8 {
 		writeError(w, http.StatusBadRequest, codeInvalidRequest, "Email válido y contraseña de 8+ caracteres requeridos.")
@@ -267,6 +290,9 @@ func (s *Server) handleSignup(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleLogout invalidates the session and clears the cookie. POST-only.
+// An optional redirect_to form value, validated against the same origin
+// allowlist as login, lets a consuming app land the user back on its own
+// signed-out page instead of Sésamo's root.
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if token := cookieValue(r, s.cfg.CookieName); token != "" {
 		if uid, err := s.sessions.Revoke(r.Context(), token); err == nil && uid != "" {
@@ -276,11 +302,14 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.clearSessionCookie(w)
+	target := s.safeRedirectTarget(r.FormValue("redirect_to"))
 	if wantsJSON(r) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "logged_out"})
+		writeJSON(w, http.StatusOK, map[string]string{
+			"status": "logged_out", "redirect_to": target,
+		})
 		return
 	}
-	http.Redirect(w, r, "/", http.StatusFound)
+	http.Redirect(w, r, target, http.StatusFound)
 }
 
 // renderMessage writes an outcome page (message.html) with the brand
@@ -507,7 +536,10 @@ func (s *Server) handleMagicLinkConfirm(w http.ResponseWriter, r *http.Request) 
 }
 
 // startSessionAndRedirect creates a session, sets the cookie, and either
-// returns JSON (headless) or redirects to the post-login target.
+// returns JSON (headless) or redirects to the post-login target. The
+// target comes from an explicit redirect_to form value (headless callers)
+// or the transient cookie captured at GET /login / OAuth start; both go
+// through the same allowlist validation on read.
 func (s *Server) startSessionAndRedirect(w http.ResponseWriter, r *http.Request, userID string) {
 	ua := r.UserAgent()
 	ip := s.clientIP(r)
@@ -521,7 +553,11 @@ func (s *Server) startSessionAndRedirect(w http.ResponseWriter, r *http.Request,
 	}
 	s.setSessionCookie(w, created.Token, created.ExpiresAt)
 
-	target := safeInternalPath(cookieValue(r, cookiePostLogin))
+	raw := r.FormValue("redirect_to")
+	if raw == "" {
+		raw = cookieValue(r, cookiePostLogin)
+	}
+	target := s.safeRedirectTarget(raw)
 	s.clearTransient(w, cookiePostLogin)
 
 	if wantsJSON(r) {
