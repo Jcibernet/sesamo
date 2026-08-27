@@ -49,7 +49,7 @@ names); (4) availability of the introspect hot path.
 | Threat | Mitigation | Evidence |
 |---|---|---|
 | One-time token replay | atomic `UPDATE … RETURNING`, single use | Threat10 |
-| Open redirect after login | `safeInternalPath` allowlists internal paths | Threat15 |
+| Open redirect after login/logout | `safeRedirectTarget`: internal paths plus the exact-match `SESAMO_REDIRECT_ORIGINS` allowlist; protocol-relative, backslash, userinfo, lookalike-host, and port-mismatch targets collapse to `/` | Threat15, TestSafeRedirectTarget, Flows 07-11 |
 | Session fixation | login always mints a fresh token; `Rotate` on privilege change | session tests |
 | Rate-limit oversubscription under concurrency | refill+consume in one transaction (row lock) | ratelimit concurrency test |
 
@@ -76,6 +76,7 @@ an account-existence oracle.
 | Threat | Mitigation | Evidence |
 |---|---|---|
 | User enumeration via login / reset / signup | identical errors, dummy Argon2id work, always-200 | Threat04-06 |
+| Self-service signup on a private deployment | `SESAMO_SIGNUP=disabled`: stable 403 on /signup without touching the DB; OAuth refuses brand-new accounts (`user.ErrSignupDisabled`) while existing users keep logging in; rejections audited as `signup.rejected` | Flow12, TestUpsertRespectsSignupPolicy |
 | Token theft from DB / backups | only SHA-256(token) stored; Argon2id PHC for passwords | schema |
 | XSS exfiltrating the cookie | HttpOnly + strict CSP (no inline scripts) + nosniff | Threat16 |
 | Secrets in logs | logging middleware: no cookies, headers, or bodies | code review rule |

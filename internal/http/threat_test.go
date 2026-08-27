@@ -381,6 +381,15 @@ func TestThreat15_OpenRedirectBlocked(t *testing.T) {
 	if got := safeInternalPath("/dashboard"); got != "/dashboard" {
 		t.Fatalf("safe internal path must pass, got %q", got)
 	}
+	if got := safeInternalPath(`/\evil.com`); got != "/" {
+		t.Fatalf("backslash escape must be neutralized, got %q", got)
+	}
+	// The allowlisted-origin variant is covered exhaustively by
+	// TestSafeRedirectTarget; here we pin that an empty allowlist keeps
+	// the historical internal-only behavior for absolute URLs.
+	if got := safeRedirectTarget(nil, "https://evil.com/x"); got != "/" {
+		t.Fatalf("absolute URL without allowlist must be neutralized, got %q", got)
+	}
 }
 
 // ── Threat vector 16: security headers present on responses ──────────
