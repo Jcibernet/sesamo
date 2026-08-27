@@ -229,6 +229,10 @@ func prodEnv() map[string]string {
 		"SESAMO_EMAIL_PROVIDER":                    "resend",
 		"SESAMO_EMAIL_API_KEY":                     "re_live_deadbeef",
 		"SESAMO_EMAIL_FROM":                        "auth@example.com",
+		"SESAMO_EMAIL_OUTBOX_KEYS":                 "k1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+		"SESAMO_RESEND_WEBHOOK_SECRET":             "",
+		"SESAMO_PROJECT_SLUG":                      "",
+		"SESAMO_PROJECT_DISPLAY_NAME":              "",
 		"SESAMO_SESSION_LIFETIME_DAYS":             "30",
 		"SESAMO_ROLLING_RENEWAL_THRESHOLD_MINUTES": "15",
 		"SESAMO_SESSION_MAX_LIFETIME_DAYS":         "90",
@@ -314,6 +318,11 @@ func TestLoad_ProductionInvariants(t *testing.T) {
 			name: "missing email api key rejected",
 			env:  map[string]string{"SESAMO_EMAIL_API_KEY": ""},
 			want: []string{"SESAMO_EMAIL_API_KEY"},
+		},
+		{
+			name: "missing email outbox keyring rejected",
+			env:  map[string]string{"SESAMO_EMAIL_OUTBOX_KEYS": ""},
+			want: []string{"SESAMO_EMAIL_OUTBOX_KEYS"},
 		},
 		{
 			name: "localhost email sender rejected",
@@ -603,5 +612,46 @@ func TestLoad_UnknownEnvRefusesToBoot(t *testing.T) {
 	})
 	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "SESAMO_ENV") {
 		t.Fatalf("Load() error = %v, want an error mentioning SESAMO_ENV", err)
+	}
+}
+
+// TestLoad_ProjectSlug pins deployment identity: the default slug is
+// valid, custom slugs are validated in every environment (the value
+// lands verbatim in the public descriptor), and a broken slug is a boot
+// failure, not a silently mangled identity.
+func TestLoad_ProjectSlug(t *testing.T) {
+	base := map[string]string{
+		"SESAMO_DATABASE_URL": "postgres://sesamo:sesamo@localhost:5999/sesamo_dummy?sslmode=disable",
+	}
+	t.Run("default", func(t *testing.T) {
+		applyEnv(t, base)
+		t.Setenv("SESAMO_PROJECT_SLUG", "")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() unexpected error: %v", err)
+		}
+		if cfg.ProjectSlug != "sesamo" {
+			t.Errorf("ProjectSlug = %q, want %q", cfg.ProjectSlug, "sesamo")
+		}
+	})
+	t.Run("custom slug accepted", func(t *testing.T) {
+		applyEnv(t, base)
+		t.Setenv("SESAMO_PROJECT_SLUG", "marketmaker-prod")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() unexpected error: %v", err)
+		}
+		if cfg.ProjectSlug != "marketmaker-prod" {
+			t.Errorf("ProjectSlug = %q, want %q", cfg.ProjectSlug, "marketmaker-prod")
+		}
+	})
+	for _, bad := range []string{"Marketmaker", "-prod", "prod-", "a b", "año"} {
+		t.Run("invalid slug "+bad, func(t *testing.T) {
+			applyEnv(t, base)
+			t.Setenv("SESAMO_PROJECT_SLUG", bad)
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), "SESAMO_PROJECT_SLUG") {
+				t.Fatalf("Load() error = %v, want an error mentioning SESAMO_PROJECT_SLUG", err)
+			}
+		})
 	}
 }

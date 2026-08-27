@@ -6,6 +6,7 @@ package metrics
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -15,6 +16,7 @@ import (
 type Registry struct {
 	mu         sync.RWMutex
 	counters   map[string]*atomic.Int64
+	gauges     map[string]*atomic.Uint64 // float64 bits
 	histograms map[string]*histogram
 }
 
@@ -22,6 +24,7 @@ type Registry struct {
 func New() *Registry {
 	return &Registry{
 		counters:   make(map[string]*atomic.Int64),
+		gauges:     make(map[string]*atomic.Uint64),
 		histograms: make(map[string]*histogram),
 	}
 }
@@ -57,6 +60,24 @@ func (r *Registry) Observe(name string, v float64) {
 		r.mu.Unlock()
 	}
 	h.observe(v)
+}
+
+// SetGauge publishes the current value of a named gauge. Unlike a
+// counter, a gauge answers "how bad is it right now" — queue depth and
+// the age of the oldest pending job are only meaningful as levels.
+func (r *Registry) SetGauge(name string, v float64) {
+	r.mu.RLock()
+	g, ok := r.gauges[name]
+	r.mu.RUnlock()
+	if !ok {
+		r.mu.Lock()
+		if g, ok = r.gauges[name]; !ok {
+			g = new(atomic.Uint64)
+			r.gauges[name] = g
+		}
+		r.mu.Unlock()
+	}
+	g.Store(math.Float64bits(v))
 }
 
 // histogram with fixed buckets tuned for sub-second auth latencies.
@@ -103,6 +124,16 @@ func (r *Registry) WritePrometheus() string {
 	for _, n := range names {
 		b = append(b, fmt.Sprintf("# TYPE %s counter\n%s %d\n",
 			n, n, r.counters[n].Load())...)
+	}
+
+	gnames := make([]string, 0, len(r.gauges))
+	for n := range r.gauges {
+		gnames = append(gnames, n)
+	}
+	sort.Strings(gnames)
+	for _, n := range gnames {
+		b = append(b, fmt.Sprintf("# TYPE %s gauge\n%s %g\n",
+			n, n, math.Float64frombits(r.gauges[n].Load()))...)
 	}
 
 	hnames := make([]string, 0, len(r.histograms))

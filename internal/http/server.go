@@ -26,16 +26,21 @@ import (
 	"github.com/jcibernet/sesamo/internal/user"
 )
 
-// Server holds shared dependencies for all handlers.
+// Server holds shared dependencies for all handlers. It is itself the
+// http.Handler: NewServer returns the value so the process can also
+// reach the pieces that live outside a request (the email worker),
+// while callers that only want to serve keep using it as a handler.
 type Server struct {
 	cfg       *config.Config
 	pool      *db.Pool
 	log       *slog.Logger
 	mux       *http.ServeMux
+	handler   http.Handler // mux wrapped in the middleware chain
 	sessions  *session.Store
 	users     *user.Store
 	tokens    *email.TokenStore
 	mailer    email.Sender
+	outbox    *email.Outbox
 	providers *oauth.Registry
 	limiter   *ratelimit.Limiter
 	metrics   *metrics.Registry
@@ -47,19 +52,28 @@ type Server struct {
 const (
 	metricHTTPPanics          = "sesamo_http_panics_total"
 	metricOAuthExchangeErrors = "sesamo_oauth_exchange_errors_total"
-	metricEmailSendErrors     = "sesamo_email_send_errors_total"
-	metricAuditWriteErrors    = "sesamo_audit_write_errors_total"
+	// The synchronous send is gone: a handler can only fail to ENQUEUE
+	// now, and delivery outcomes are counted by the outbox worker.
+	metricEmailQueueErrors = "sesamo_email_queue_errors_total"
+	metricAuditWriteErrors = "sesamo_audit_write_errors_total"
 )
 
 // NewServer builds the full handler tree. It returns an error when a
 // configured dependency cannot be constructed — an OAuth provider the
 // operator asked for, above all: starting without it would silently
-// serve a login page missing a login method.
-func NewServer(cfg *config.Config, pool *db.Pool, log *slog.Logger) (http.Handler, error) {
+// serve a login page missing a login method. Same reasoning for the
+// outbox keyring: a deployment that cannot encrypt a queued link must
+// not start and queue it in clear.
+func NewServer(cfg *config.Config, pool *db.Pool, log *slog.Logger) (*Server, error) {
 	providers, err := buildProviders(cfg)
 	if err != nil {
 		return nil, err
 	}
+	keyring, err := buildOutboxKeyring(cfg, log)
+	if err != nil {
+		return nil, err
+	}
+	reg := metrics.New()
 	s := &Server{
 		cfg:  cfg,
 		pool: pool,
@@ -73,20 +87,53 @@ func NewServer(cfg *config.Config, pool *db.Pool, log *slog.Logger) (http.Handle
 		users:     user.NewStore(pool),
 		tokens:    email.NewTokenStore(pool),
 		mailer:    email.New(cfg.EmailProvider, cfg.EmailFrom, cfg.EmailAPIKey, log),
+		outbox:    email.NewOutbox(pool, keyring, log, reg),
 		providers: providers,
 		limiter:   ratelimit.New(pool),
-		metrics:   metrics.New(),
+		metrics:   reg,
 		audit:     audit.New(pool, log, cfg.AuditStrict),
 		brandCSS:  ui.BrandCSS(ui.BrandInput(cfg.Brand)),
 	}
 	s.csp = buildCSP(cfg)
 
-	s.registerOps()     // healthz, readyz, metrics
-	s.registerEndUser() // /login, /logout, /signup, /reset, /auth/*
-	s.registerService() // /v1/introspect, /v1/sessions/revoke
-	s.registerAdmin()   // /v1/admin/*
+	s.registerOps()        // healthz, readyz, metrics
+	s.registerEndUser()    // /login, /logout, /signup, /reset, /auth/*
+	s.registerService()    // /v1/introspect, /v1/sessions/revoke
+	s.registerAdmin()      // /v1/admin/*
+	s.registerWebhooks()   // /v1/webhooks/resend
+	s.registerDescriptor() // /.well-known/sesamo, /openapi.json, /llms.txt
 
-	return s.withSecurityHeaders(s.withRequestID(s.withLogging(s.withRecover(s.withBodyLimit(s.mux))))), nil
+	s.handler = s.withSecurityHeaders(s.withRequestID(s.withLogging(s.withRecover(s.withBodyLimit(s.mux)))))
+	return s, nil
+}
+
+// ServeHTTP runs the middleware chain built by NewServer.
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.handler.ServeHTTP(w, r)
+}
+
+// EmailWorker returns the outbox worker this server's handlers enqueue
+// into. It shares the server's metrics registry, so queue depth and
+// delivery outcomes appear on the same /metrics as everything else.
+func (s *Server) EmailWorker() *email.Worker {
+	return email.NewWorker(s.outbox, s.cfg.EmailProvider, s.mailer, s.log, s.metrics)
+}
+
+// EmailOutbox exposes the outbox for out-of-band maintenance (purge).
+func (s *Server) EmailOutbox() *email.Outbox { return s.outbox }
+
+// buildOutboxKeyring resolves the key that encrypts queued email
+// payloads. Production config already requires the keyring; development
+// gets a random boot key instead of a plaintext fallback, so the
+// invariant "Postgres never holds a usable bearer link" holds in every
+// environment. Jobs still pending across a dev restart become
+// undecryptable and are retired terminally — the correct failure.
+func buildOutboxKeyring(cfg *config.Config, log *slog.Logger) (*email.Keyring, error) {
+	if cfg.EmailOutboxKeys == "" {
+		log.Warn("email outbox: no keyring configured; using an ephemeral boot key (development only)")
+		return email.NewEphemeralKeyring()
+	}
+	return email.ParseKeyring(cfg.EmailOutboxKeys)
 }
 
 // buildProviders registers exactly the OAuth providers the operator

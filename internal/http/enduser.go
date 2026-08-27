@@ -315,27 +315,33 @@ func (s *Server) handleSignup(w http.ResponseWriter, r *http.Request) {
 		if err := s.users.CreateWithPasswordTx(r.Context(), tx, id, emailAddr, hash); err != nil {
 			return auditRecord{}, err
 		}
+		// The verification mail is queued in the same transaction as the
+		// user row: a signup that answers "verification_sent" has a job
+		// that will be delivered, and a rolled-back signup leaves no mail
+		// promising an account that does not exist.
+		if err := s.queueOneTimeLinkTx(r.Context(), tx, id, emailAddr, email.PurposeVerify,
+			"/verify", "Verificá tu email", 24*time.Hour); err != nil {
+			return auditRecord{}, err
+		}
 		return auditRecord{event: audit.Signup, actor: id, detail: map[string]any{"email": emailAddr}}, nil
 	})
 	if err != nil {
-		// Two very different failures collapse into one response on
+		// Three very different failures collapse into one response on
 		// purpose. A duplicate email must look like a fresh signup
-		// (anti-enumeration), and a strict-mode audit outage must look
-		// the same as that: a 500 here would only ever fire for emails
-		// that DID insert, turning the outage into an existence oracle.
-		// Same degradation /reset and /magiclink already accept.
+		// (anti-enumeration), and a strict-mode audit outage or a failed
+		// enqueue must look the same as that: a 500 here would only ever
+		// fire for emails that DID insert, turning the outage into an
+		// existence oracle. Same degradation /reset and /magiclink accept.
 		var auditErr auditWriteError
 		if errors.As(err, &auditErr) {
 			s.log.Warn("signup rolled back by strict audit failure (masked as 200)", "err", err)
 		} else {
 			s.log.Info("signup conflict or error (masked)", "err", err)
+			s.metrics.IncCounter(metricEmailQueueErrors)
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "verification_sent"})
 		return
 	}
-
-	s.sendOneTimeLink(r, id, emailAddr, email.PurposeVerify, "/verify",
-		"Verificá tu email", 24*time.Hour)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "verification_sent"})
 }
 
@@ -468,14 +474,20 @@ func (s *Server) handleResetRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	u, err := s.users.ByEmail(r.Context(), emailAddr)
 	if err == nil && u != nil {
-		// Evidence before action; on strict-mode audit failure skip the
-		// email but keep the generic 200 — a 500 only for existing
-		// accounts would turn audit outages into an enumeration oracle.
-		if err := s.audit.Record(r.Context(), audit.ResetRequested, u.ID, s.clientIP(r), nil); err == nil {
-			s.sendOneTimeLink(r, u.ID, emailAddr, email.PurposeReset, "/reset/confirm",
-				"Restablecé tu contraseña", 15*time.Minute)
-		} else {
-			s.metrics.IncCounter(metricAuditWriteErrors)
+		// Evidence, token and queued mail share one transaction. On any
+		// failure — strict-mode audit outage included — nothing is
+		// queued and the response stays the generic 200: a 500 only for
+		// existing accounts would turn an outage into an enumeration
+		// oracle.
+		if err := s.auditedTx(r.Context(), s.clientIP(r), func(tx pgx.Tx) (auditRecord, error) {
+			if err := s.queueOneTimeLinkTx(r.Context(), tx, u.ID, emailAddr, email.PurposeReset,
+				"/reset/confirm", "Restablecé tu contraseña", 15*time.Minute); err != nil {
+				return auditRecord{}, err
+			}
+			return auditRecord{event: audit.ResetRequested, actor: u.ID}, nil
+		}); err != nil {
+			s.metrics.IncCounter(metricEmailQueueErrors)
+			s.log.Warn("reset link not queued (masked as 200)", "err", err)
 		}
 	}
 	if wantsJSON(r) {
@@ -605,12 +617,18 @@ func (s *Server) handleMagicLinkRequest(w http.ResponseWriter, r *http.Request) 
 	// the kill switch cannot be worked around by asking for a fresh one,
 	// and the response stays identical either way.
 	if err == nil && u != nil && !u.Disabled {
-		// Same enumeration-safe degradation as /reset above.
-		if err := s.audit.Record(r.Context(), audit.MagicLinkRequest, u.ID, s.clientIP(r), nil); err == nil {
-			s.sendOneTimeLink(r, u.ID, emailAddr, email.PurposeMagicLink, "/magiclink/confirm",
-				"Tu enlace de acceso", 15*time.Minute)
-		} else {
-			s.metrics.IncCounter(metricAuditWriteErrors)
+		// Same enumeration-safe degradation as /reset above: evidence,
+		// token and queued mail commit together or not at all, and the
+		// caller cannot tell which happened.
+		if err := s.auditedTx(r.Context(), s.clientIP(r), func(tx pgx.Tx) (auditRecord, error) {
+			if err := s.queueOneTimeLinkTx(r.Context(), tx, u.ID, emailAddr, email.PurposeMagicLink,
+				"/magiclink/confirm", "Tu enlace de acceso", 15*time.Minute); err != nil {
+				return auditRecord{}, err
+			}
+			return auditRecord{event: audit.MagicLinkRequest, actor: u.ID}, nil
+		}); err != nil {
+			s.metrics.IncCounter(metricEmailQueueErrors)
+			s.log.Warn("magic link not queued (masked as 200)", "err", err)
 		}
 	}
 	if wantsJSON(r) {
@@ -728,19 +746,39 @@ func (s *Server) finishLogin(w http.ResponseWriter, r *http.Request, created ses
 	http.Redirect(w, r, target, http.StatusFound)
 }
 
-// sendOneTimeLink issues a token and emails a link to path?token=...
-func (s *Server) sendOneTimeLink(r *http.Request, userID, to string, purpose email.Purpose, path, subject string, ttl time.Duration) {
-	token, err := s.tokens.Issue(r.Context(), userID, purpose, ttl)
+// sendBeforeMargin keeps the worker from delivering a link that is about
+// to expire: a user who receives a reset mail whose token dies a few
+// seconds later experiences a broken product, not a security feature.
+const sendBeforeMargin = time.Minute
+
+// queueOneTimeLinkTx mints a one-time token and queues the email that
+// carries it, both inside the caller's transaction.
+//
+// This is the atomicity the outbox exists for: a rollback leaves neither
+// a token nobody was told about nor a queued link to a token that does
+// not exist. Delivery itself happens outside the request, in the worker,
+// so a provider outage no longer loses the mail — and no longer holds a
+// pooled connection while an external API times out.
+func (s *Server) queueOneTimeLinkTx(ctx context.Context, tx pgx.Tx, userID, to string,
+	purpose email.Purpose, path, subject string, ttl time.Duration,
+) error {
+	token, tokenID, err := s.tokens.IssueTx(ctx, tx, userID, purpose, ttl)
 	if err != nil {
-		s.log.Error("issue token", "err", err, "purpose", purpose)
-		return
+		return err
 	}
 	link := s.cfg.BaseURL + path + "?token=" + token
 	body := subject + ":\n\n" + link + "\n\nEste enlace expira pronto y se usa una sola vez."
-	if err := s.mailer.Send(r.Context(), email.Message{To: to, Subject: subject, Body: body}); err != nil {
-		s.metrics.IncCounter(metricEmailSendErrors)
-		s.log.Error("send email", "err", err)
-	}
+	return s.outbox.QueueTx(ctx, tx, email.QueueInput{
+		UserID:     userID,
+		TokenID:    tokenID,
+		To:         to,
+		From:       s.cfg.EmailFrom,
+		Subject:    subject,
+		Body:       body,
+		Purpose:    purpose,
+		Provider:   s.cfg.EmailProvider,
+		SendBefore: time.Now().Add(ttl - sendBeforeMargin),
+	})
 }
 
 // oauthFail renders an OAuth failure as JSON or a redirect to /login.
