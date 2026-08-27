@@ -17,6 +17,7 @@
 
     {{if .Password}}
     <form method="POST" action="{{.BaseURL}}/login">
+      <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
       <div class="sesamo-field">
         <label for="email">Email</label>
         <input id="email" name="email" type="email" autocomplete="email" required>
@@ -33,6 +34,7 @@
     </form>
     {{else if .MagicLink}}
     <form method="POST" action="{{.BaseURL}}/magiclink">
+      <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
       <div class="sesamo-field">
         <label for="email">Email</label>
         <input id="email" name="email" type="email" autocomplete="email" required>

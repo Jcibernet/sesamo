@@ -40,8 +40,15 @@ type Server struct {
 	csp       string // precomputed Content-Security-Policy value
 }
 
-// NewServer builds the full handler tree.
-func NewServer(cfg *config.Config, pool *db.Pool, log *slog.Logger) http.Handler {
+// NewServer builds the full handler tree. It returns an error when a
+// configured dependency cannot be constructed — an OAuth provider the
+// operator asked for, above all: starting without it would silently
+// serve a login page missing a login method.
+func NewServer(cfg *config.Config, pool *db.Pool, log *slog.Logger) (http.Handler, error) {
+	providers, err := buildProviders(cfg)
+	if err != nil {
+		return nil, err
+	}
 	s := &Server{
 		cfg:  cfg,
 		pool: pool,
@@ -50,11 +57,12 @@ func NewServer(cfg *config.Config, pool *db.Pool, log *slog.Logger) http.Handler
 		sessions: session.NewStore(pool, session.Config{
 			Lifetime:                cfg.SessionLifetime,
 			RollingRenewalThreshold: cfg.RollingRenewalThreshold,
+			MaxLifetime:             cfg.SessionMaxLifetime,
 		}),
 		users:     user.NewStore(pool),
 		tokens:    email.NewTokenStore(pool),
 		mailer:    email.New(cfg.EmailProvider, cfg.EmailFrom, cfg.EmailAPIKey, log),
-		providers: buildProviders(cfg, log),
+		providers: providers,
 		limiter:   ratelimit.New(pool),
 		metrics:   metrics.New(),
 		audit:     audit.New(pool, log, cfg.AuditStrict),
@@ -67,10 +75,15 @@ func NewServer(cfg *config.Config, pool *db.Pool, log *slog.Logger) http.Handler
 	s.registerService() // /v1/introspect, /v1/sessions/revoke
 	s.registerAdmin()   // /v1/admin/*
 
-	return s.withSecurityHeaders(s.withLogging(s.withBodyLimit(s.mux)))
+	return s.withSecurityHeaders(s.withLogging(s.withBodyLimit(s.mux))), nil
 }
 
-func buildProviders(cfg *config.Config, log *slog.Logger) *oauth.Registry {
+// buildProviders registers exactly the OAuth providers the operator
+// configured. A configured-but-unconstructable provider (Apple with an
+// unparseable PEM) is a boot failure, not a warning: logging and
+// continuing produced a server whose Apple button 404s while the
+// operator's logs scrolled past the one line that said why.
+func buildProviders(cfg *config.Config) (*oauth.Registry, error) {
 	reg := oauth.NewRegistry()
 	if cfg.Google.Enabled() {
 		reg.Add(oauth.NewGoogle(cfg.Google.ClientID, cfg.Google.ClientSecret, cfg.Google.RedirectURI))
@@ -82,12 +95,11 @@ func buildProviders(cfg *config.Config, log *slog.Logger) *oauth.Registry {
 		ap, err := oauth.NewApple(cfg.Apple.ClientID, cfg.Apple.TeamID, cfg.Apple.KeyID,
 			cfg.Apple.PrivateKey, cfg.Apple.RedirectURI)
 		if err != nil {
-			log.Error("apple provider disabled", "err", err)
-		} else {
-			reg.Add(ap)
+			return nil, err
 		}
+		reg.Add(ap)
 	}
-	return reg
+	return reg, nil
 }
 
 // buildCSP assembles the Content-Security-Policy once at startup. The

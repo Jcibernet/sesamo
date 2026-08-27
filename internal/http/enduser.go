@@ -1,9 +1,12 @@
 package http
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/jcibernet/sesamo/internal/audit"
 	"github.com/jcibernet/sesamo/internal/config"
@@ -21,7 +24,7 @@ func (s *Server) registerEndUser() {
 	s.mux.HandleFunc("GET /ui/brand.css", s.handleBrandCSS)
 	s.mux.HandleFunc("POST /login", s.handlePasswordLogin)
 	s.mux.HandleFunc("POST /signup", s.handleSignup)
-	s.mux.HandleFunc("POST /logout", s.handleLogout) // POST-only (anti-CSRF)
+	s.mux.HandleFunc("POST /logout", s.handleLogout) // POST-only + CSRF token
 	s.mux.HandleFunc("GET /auth/{provider}", s.handleOAuthStart)
 	s.mux.HandleFunc("GET /auth/{provider}/callback", s.handleOAuthCallback)
 	s.mux.HandleFunc("GET /reset", s.handleResetRequestPage)
@@ -41,10 +44,15 @@ func (s *Server) handleLoginPage(w http.ResponseWriter, r *http.Request) {
 	// magic-link flows have no provider round trip to carry state, so the
 	// login page is where the destination enters the system.
 	s.captureRedirect(w, r)
+	// The CSRF cookie is HttpOnly, so a headless frontend cannot read it
+	// back: handing the value out here is the only way it can complete
+	// the double-submit pair on the POSTs below.
+	csrf := s.issueCSRFToken(w)
 	if wantsJSON(r) {
 		payload := map[string]any{
-			"providers": s.providers.Names(),
-			"methods":   []string{"password", "magiclink"},
+			"providers":  s.providers.Names(),
+			"methods":    []string{"password", "magiclink"},
+			"csrf_token": csrf,
 		}
 		// Branding for custom frontends (Auth0 branding-API parity):
 		// a headless UI can render the operator's look without
@@ -81,6 +89,7 @@ func (s *Server) handleLoginPage(w http.ResponseWriter, r *http.Request) {
 		BrandCSS:    len(s.brandCSS) > 0,
 		LogoURL:     s.cfg.Brand.LogoURL,
 		Error:       r.URL.Query().Get("error"),
+		CSRFToken:   csrf,
 	}); err != nil {
 		s.log.Error("render login", "err", err)
 		writeError(w, http.StatusInternalServerError, codeInternal, "Error interno.")
@@ -173,30 +182,46 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	res, err := s.users.UpsertByOAuth(r.Context(), profile, s.cfg.Signup != config.SignupDisabled)
-	if errors.Is(err, user.ErrSignupDisabled) {
+	switch {
+	case errors.Is(err, user.ErrSignupDisabled):
 		if !s.recordAudit(w, r, audit.SignupRejected, "",
 			map[string]any{"method": "oauth", "provider": name, "reason": "signup_disabled"}) {
 			return
 		}
 		s.oauthFail(w, r, codeForbidden, "El registro está deshabilitado.")
 		return
-	}
-	if err != nil {
+	case errors.Is(err, user.ErrUserDisabled):
+		// The provider vouched for the identity; the deployment refuses
+		// the account. Generic login failure, no session, and the real
+		// reason stays in the audit trail where it belongs.
+		if !s.recordAudit(w, r, audit.LoginFailed, "",
+			map[string]any{"method": "oauth", "provider": name, "reason": "user_disabled"}) {
+			return
+		}
+		s.oauthFail(w, r, codeOAuthFailed, "No pudimos iniciar sesión. Probá de nuevo.")
+		return
+	case err != nil:
 		s.log.Error("upsert oauth user", "err", err)
 		writeError(w, http.StatusInternalServerError, codeInternal, "Error interno.")
 		return
 	}
 
-	if !s.recordAudit(w, r, audit.LoginSuccess, res.UserID,
-		map[string]any{"method": "oauth", "provider": name}) {
+	created, _, err := s.loginTx(r, map[string]any{"method": "oauth", "provider": name},
+		func(pgx.Tx) (string, error) { return res.UserID, nil })
+	if err != nil {
+		s.log.Error("start oauth session", "err", err, "provider", name)
+		writeError(w, http.StatusInternalServerError, codeInternal, "Error interno.")
 		return
 	}
-	s.startSessionAndRedirect(w, r, res.UserID)
+	s.finishLogin(w, r, created)
 }
 
 // handlePasswordLogin authenticates email+password. Anti-enumeration:
-// identical error + dummy hash work when the user is absent.
+// identical error + dummy hash work when the user is absent OR disabled.
 func (s *Server) handlePasswordLogin(w http.ResponseWriter, r *http.Request) {
+	if !s.checkCSRF(w, r) {
+		return
+	}
 	emailAddr, password := r.FormValue("email"), r.FormValue("password")
 	if emailAddr == "" || password == "" {
 		writeError(w, http.StatusBadRequest, codeInvalidRequest, "Email y contraseña requeridos.")
@@ -208,26 +233,32 @@ func (s *Server) handlePasswordLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	userID, hash, ok, err := s.users.PasswordHash(r.Context(), emailAddr)
+	cred, err := s.users.PasswordCredential(r.Context(), emailAddr)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, codeInternal, "Error interno.")
 		return
 	}
-	if !ok {
-		// User missing or has no password: do dummy work to equalize
-		// timing, then return the SAME generic error.
+	if !cred.HasPassword || cred.Disabled {
+		// Missing, password-less, or disabled: do dummy work to equalize
+		// timing, then return the SAME generic error. A disabled account
+		// must be indistinguishable from a nonexistent one, so only the
+		// audit reason differs — and that never reaches the client.
 		crypto.DummyVerify(password)
-		if !s.recordAudit(w, r, audit.LoginFailed, "",
-			map[string]any{"method": "password", "email": emailAddr, "reason": "unknown_user"}) {
+		reason, actor := "unknown_user", ""
+		if cred.Disabled {
+			reason, actor = "user_disabled", cred.UserID
+		}
+		if !s.recordAudit(w, r, audit.LoginFailed, actor,
+			map[string]any{"method": "password", "email": emailAddr, "reason": reason}) {
 			return
 		}
 		writeError(w, http.StatusUnauthorized, codeInvalidCredentials, "Email o contraseña incorrectos.")
 		return
 	}
 
-	valid, needsRehash, err := crypto.VerifyPassword(password, hash)
+	valid, needsRehash, err := crypto.VerifyPassword(password, cred.Hash)
 	if err != nil || !valid {
-		if !s.recordAudit(w, r, audit.LoginFailed, userID,
+		if !s.recordAudit(w, r, audit.LoginFailed, cred.UserID,
 			map[string]any{"method": "password", "email": emailAddr, "reason": "bad_password"}) {
 			return
 		}
@@ -238,19 +269,25 @@ func (s *Server) handlePasswordLogin(w http.ResponseWriter, r *http.Request) {
 	// Lazy migration: re-hash bcrypt (Auth0 import) to Argon2id.
 	if needsRehash {
 		if newHash, err := crypto.HashPassword(password); err == nil {
-			_ = s.users.SetPassword(r.Context(), userID, newHash)
+			_ = s.users.SetPassword(r.Context(), cred.UserID, newHash)
 		}
 	}
 
-	if !s.recordAudit(w, r, audit.LoginSuccess, userID,
-		map[string]any{"method": "password"}) {
+	created, _, err := s.loginTx(r, map[string]any{"method": "password"},
+		func(pgx.Tx) (string, error) { return cred.UserID, nil })
+	if err != nil {
+		s.log.Error("start password session", "err", err)
+		writeError(w, http.StatusInternalServerError, codeInternal, "Error interno.")
 		return
 	}
-	s.startSessionAndRedirect(w, r, userID)
+	s.finishLogin(w, r, created)
 }
 
 // handleSignup creates a password user and sends a verification email.
 func (s *Server) handleSignup(w http.ResponseWriter, r *http.Request) {
+	if !s.checkCSRF(w, r) {
+		return
+	}
 	if s.cfg.Signup == config.SignupDisabled {
 		// One stable response for every caller: the branch never touches
 		// the database, so it cannot leak whether an account exists.
@@ -273,32 +310,62 @@ func (s *Server) handleSignup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := crypto.UUIDv7()
-	if err := s.users.CreateWithPassword(r.Context(), id, emailAddr, hash); err != nil {
-		// Do not reveal whether the email already exists: respond 200 as
-		// if a verification email was sent (anti-enumeration).
-		s.log.Info("signup conflict or error (masked)", "err", err)
+	err = s.auditedTx(r.Context(), s.clientIP(r), func(tx pgx.Tx) (auditRecord, error) {
+		if err := s.users.CreateWithPasswordTx(r.Context(), tx, id, emailAddr, hash); err != nil {
+			return auditRecord{}, err
+		}
+		return auditRecord{event: audit.Signup, actor: id, detail: map[string]any{"email": emailAddr}}, nil
+	})
+	if err != nil {
+		// Two very different failures collapse into one response on
+		// purpose. A duplicate email must look like a fresh signup
+		// (anti-enumeration), and a strict-mode audit outage must look
+		// the same as that: a 500 here would only ever fire for emails
+		// that DID insert, turning the outage into an existence oracle.
+		// Same degradation /reset and /magiclink already accept.
+		var auditErr auditWriteError
+		if errors.As(err, &auditErr) {
+			s.log.Warn("signup rolled back by strict audit failure (masked as 200)", "err", err)
+		} else {
+			s.log.Info("signup conflict or error (masked)", "err", err)
+		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "verification_sent"})
 		return
 	}
 
-	if !s.recordAudit(w, r, audit.Signup, id, map[string]any{"email": emailAddr}) {
-		return
-	}
 	s.sendOneTimeLink(r, id, emailAddr, email.PurposeVerify, "/verify",
 		"Verificá tu email", 24*time.Hour)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "verification_sent"})
 }
 
-// handleLogout invalidates the session and clears the cookie. POST-only.
-// An optional redirect_to form value, validated against the same origin
-// allowlist as login, lets a consuming app land the user back on its own
-// signed-out page instead of Sésamo's root.
+// handleLogout invalidates the session and clears the cookie. POST-only
+// plus a CSRF token. An optional redirect_to form value, validated
+// against the same origin allowlist as login, lets a consuming app land
+// the user back on its own signed-out page instead of Sésamo's root.
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	if !s.checkCSRF(w, r) {
+		return
+	}
 	if token := cookieValue(r, s.cfg.CookieName); token != "" {
-		if uid, err := s.sessions.Revoke(r.Context(), token); err == nil && uid != "" {
-			if !s.recordAudit(w, r, audit.Logout, uid, nil) {
-				return
+		err := s.auditedTx(r.Context(), s.clientIP(r), func(tx pgx.Tx) (auditRecord, error) {
+			uid, err := s.sessions.RevokeTx(r.Context(), tx, token)
+			if err != nil {
+				return auditRecord{}, err
 			}
+			if uid == "" {
+				// Stale or forged cookie: nothing was revoked, so there
+				// is no event to evidence.
+				return auditRecord{}, nil
+			}
+			return auditRecord{event: audit.Logout, actor: uid}, nil
+		})
+		if err != nil {
+			// The session is still alive, so the cookie stays: clearing it
+			// would strand a live session with no way for its owner to
+			// reach it again. The client can retry.
+			s.log.Error("logout", "err", err)
+			writeError(w, http.StatusInternalServerError, codeInternal, "Error interno.")
+			return
 		}
 	}
 	s.clearSessionCookie(w)
@@ -333,8 +400,11 @@ func (s *Server) renderMessage(w http.ResponseWriter, status int, title, body st
 // handleResetRequestPage renders the "request a reset link" form. The
 // login page links here ("¿Olvidaste tu contraseña?").
 func (s *Server) handleResetRequestPage(w http.ResponseWriter, r *http.Request) {
+	csrf := s.issueCSRFToken(w)
 	if wantsJSON(r) {
-		writeJSON(w, http.StatusOK, map[string]any{"method": "POST", "fields": []string{"email"}})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"method": "POST", "fields": []string{"email"}, "csrf_token": csrf,
+		})
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -343,6 +413,7 @@ func (s *Server) handleResetRequestPage(w http.ResponseWriter, r *http.Request) 
 		ThemeCSSURL: s.cfg.ThemeCSSURL,
 		BrandCSS:    len(s.brandCSS) > 0,
 		LogoURL:     s.cfg.Brand.LogoURL,
+		CSRFToken:   csrf,
 	}); err != nil {
 		s.log.Error("render reset request", "err", err)
 		writeError(w, http.StatusInternalServerError, codeInternal, "Error interno.")
@@ -354,8 +425,11 @@ func (s *Server) handleResetRequestPage(w http.ResponseWriter, r *http.Request) 
 // spends it, so previewing the page can't burn the single use.
 func (s *Server) handleResetConfirmPage(w http.ResponseWriter, r *http.Request) {
 	token := r.URL.Query().Get("token")
+	csrf := s.issueCSRFToken(w)
 	if wantsJSON(r) {
-		writeJSON(w, http.StatusOK, map[string]any{"method": "POST", "fields": []string{"token", "password"}})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"method": "POST", "fields": []string{"token", "password"}, "csrf_token": csrf,
+		})
 		return
 	}
 	if token == "" {
@@ -370,6 +444,7 @@ func (s *Server) handleResetConfirmPage(w http.ResponseWriter, r *http.Request) 
 		BrandCSS:    len(s.brandCSS) > 0,
 		LogoURL:     s.cfg.Brand.LogoURL,
 		Token:       token,
+		CSRFToken:   csrf,
 	}); err != nil {
 		s.log.Error("render reset confirm", "err", err)
 		writeError(w, http.StatusInternalServerError, codeInternal, "Error interno.")
@@ -379,6 +454,9 @@ func (s *Server) handleResetConfirmPage(w http.ResponseWriter, r *http.Request) 
 // handleResetRequest always returns 200 to avoid revealing whether the
 // email exists. If it does, a reset link is sent.
 func (s *Server) handleResetRequest(w http.ResponseWriter, r *http.Request) {
+	if !s.checkCSRF(w, r) {
+		return
+	}
 	emailAddr := r.FormValue("email")
 	if emailAddr == "" {
 		writeError(w, http.StatusBadRequest, codeInvalidRequest, "Email requerido.")
@@ -406,14 +484,45 @@ func (s *Server) handleResetRequest(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleResetConfirm consumes a reset token and sets the new password.
+// Spending the token, storing the hash, killing every existing session,
+// and recording the evidence are one transaction: a partial reset would
+// either leave the user locked out of a burned link or leave the old
+// sessions alive after telling them otherwise.
 func (s *Server) handleResetConfirm(w http.ResponseWriter, r *http.Request) {
+	if !s.checkCSRF(w, r) {
+		return
+	}
 	token, password := r.FormValue("token"), r.FormValue("password")
 	if token == "" || len(password) < 8 {
 		writeError(w, http.StatusBadRequest, codeInvalidRequest, "Token y contraseña de 8+ caracteres requeridos.")
 		return
 	}
-	userID, err := s.tokens.Consume(r.Context(), token, email.PurposeReset)
+	// Hash before opening the transaction: Argon2id is ~100ms of CPU and
+	// must not hold a pooled connection. Side benefit — every request
+	// pays it, so response time no longer distinguishes a valid token
+	// from a spent one.
+	hash, err := crypto.HashPassword(password)
 	if err != nil {
+		writeError(w, http.StatusInternalServerError, codeInternal, "Error interno.")
+		return
+	}
+
+	err = s.auditedTx(r.Context(), s.clientIP(r), func(tx pgx.Tx) (auditRecord, error) {
+		userID, err := s.tokens.ConsumeTx(r.Context(), tx, token, email.PurposeReset)
+		if err != nil {
+			return auditRecord{}, err
+		}
+		if err := s.users.SetPasswordTx(r.Context(), tx, userID, hash); err != nil {
+			return auditRecord{}, err
+		}
+		// Reset implies privilege change: kill all existing sessions.
+		if err := s.sessions.RevokeAllForUserTx(r.Context(), tx, userID); err != nil {
+			return auditRecord{}, err
+		}
+		return auditRecord{event: audit.ResetCompleted, actor: userID,
+			detail: map[string]any{"sessions_revoked": "all"}}, nil
+	})
+	if errors.Is(err, email.ErrInvalidToken) {
 		if wantsJSON(r) {
 			writeError(w, http.StatusBadRequest, codeInvalidRequest, "Token inválido o expirado.")
 			return
@@ -422,19 +531,11 @@ func (s *Server) handleResetConfirm(w http.ResponseWriter, r *http.Request) {
 			"El enlace ya fue usado o expiró. Pedí uno nuevo desde \"¿Olvidaste tu contraseña?\".")
 		return
 	}
-	hash, err := crypto.HashPassword(password)
 	if err != nil {
+		// Nothing was applied and the token was not spent, so the same
+		// link works on retry.
+		s.log.Error("reset confirm", "err", err)
 		writeError(w, http.StatusInternalServerError, codeInternal, "Error interno.")
-		return
-	}
-	if err := s.users.SetPassword(r.Context(), userID, hash); err != nil {
-		writeError(w, http.StatusInternalServerError, codeInternal, "Error interno.")
-		return
-	}
-	// Reset implies privilege change: kill all existing sessions.
-	_ = s.sessions.RevokeAllForUser(r.Context(), userID)
-	if !s.recordAudit(w, r, audit.ResetCompleted, userID,
-		map[string]any{"sessions_revoked": "all"}) {
 		return
 	}
 	if wantsJSON(r) {
@@ -479,6 +580,9 @@ func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
 
 // handleMagicLinkRequest emails a one-time login link. Always 200.
 func (s *Server) handleMagicLinkRequest(w http.ResponseWriter, r *http.Request) {
+	if !s.checkCSRF(w, r) {
+		return
+	}
 	emailAddr := r.FormValue("email")
 	if emailAddr == "" {
 		if wantsJSON(r) {
@@ -494,7 +598,10 @@ func (s *Server) handleMagicLinkRequest(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	u, err := s.users.ByEmail(r.Context(), emailAddr)
-	if err == nil && u != nil {
+	// A disabled account is treated as nonexistent: no link is minted, so
+	// the kill switch cannot be worked around by asking for a fresh one,
+	// and the response stays identical either way.
+	if err == nil && u != nil && !u.Disabled {
 		// Same enumeration-safe degradation as /reset above.
 		if s.audit.Record(r.Context(), audit.MagicLinkRequest, u.ID, s.clientIP(r), nil) == nil {
 			s.sendOneTimeLink(r, u.ID, emailAddr, email.PurposeMagicLink, "/magiclink/confirm",
@@ -510,14 +617,41 @@ func (s *Server) handleMagicLinkRequest(w http.ResponseWriter, r *http.Request) 
 }
 
 // handleMagicLinkConfirm consumes a magic link and starts a session.
+// Spending the token, verifying the email, creating the session and
+// recording the evidence are one transaction, so a failure anywhere
+// leaves the link usable instead of burning it for nothing.
 func (s *Server) handleMagicLinkConfirm(w http.ResponseWriter, r *http.Request) {
 	token := r.URL.Query().Get("token")
 	if token == "" {
 		writeError(w, http.StatusBadRequest, codeInvalidRequest, "Token requerido.")
 		return
 	}
-	userID, err := s.tokens.Consume(r.Context(), token, email.PurposeMagicLink)
-	if err != nil {
+	created, _, err := s.loginTx(r, map[string]any{"method": "magiclink"},
+		func(tx pgx.Tx) (string, error) {
+			userID, err := s.tokens.ConsumeTx(r.Context(), tx, token, email.PurposeMagicLink)
+			if err != nil {
+				return "", err
+			}
+			// The kill switch outranks a valid link. The check shares the
+			// token's transaction, so refusing here un-spends it: the
+			// link still works if the account is re-enabled in time.
+			disabled, err := s.users.DisabledTx(r.Context(), tx, userID)
+			if err != nil {
+				return "", err
+			}
+			if disabled {
+				return "", user.ErrUserDisabled
+			}
+			// A magic link also verifies the email (proof of inbox control).
+			if err := s.users.MarkEmailVerifiedTx(r.Context(), tx, userID); err != nil {
+				return "", err
+			}
+			return userID, nil
+		})
+	if errors.Is(err, email.ErrInvalidToken) || errors.Is(err, user.ErrUserDisabled) {
+		// One answer for both: "this link does not work". Splitting them
+		// would tell whoever holds the link that the account exists but
+		// is disabled.
 		if wantsJSON(r) {
 			writeError(w, http.StatusBadRequest, codeInvalidRequest, "Enlace inválido o expirado.")
 			return
@@ -526,32 +660,52 @@ func (s *Server) handleMagicLinkConfirm(w http.ResponseWriter, r *http.Request) 
 			"El enlace de acceso ya fue usado o expiró. Pedí uno nuevo desde la pantalla de inicio de sesión.")
 		return
 	}
-	// A magic link also verifies the email (proof of inbox control).
-	_ = s.users.MarkEmailVerified(r.Context(), userID)
-	if !s.recordAudit(w, r, audit.LoginSuccess, userID,
-		map[string]any{"method": "magiclink"}) {
-		return
-	}
-	s.startSessionAndRedirect(w, r, userID)
-}
-
-// startSessionAndRedirect creates a session, sets the cookie, and either
-// returns JSON (headless) or redirects to the post-login target. The
-// target comes from an explicit redirect_to form value (headless callers)
-// or the transient cookie captured at GET /login / OAuth start; both go
-// through the same allowlist validation on read.
-func (s *Server) startSessionAndRedirect(w http.ResponseWriter, r *http.Request, userID string) {
-	ua := r.UserAgent()
-	ip := s.clientIP(r)
-	created, err := s.sessions.Create(r.Context(), session.CreateInput{
-		UserID: userID, UserAgent: &ua, IPFirst: &ip,
-	})
 	if err != nil {
-		s.log.Error("create session", "err", err)
+		s.log.Error("magiclink confirm", "err", err)
 		writeError(w, http.StatusInternalServerError, codeInternal, "Error interno.")
 		return
 	}
+	s.finishLogin(w, r, created)
+}
+
+// loginTx runs the flow-specific work that identifies the user, inserts
+// the session, and records the login evidence — all under one
+// transaction (see auditedTx for the atomicity contract). resolve runs
+// inside that transaction, so a flow that spends a one-time token
+// un-spends it when anything downstream fails.
+func (s *Server) loginTx(r *http.Request, detail map[string]any,
+	resolve func(pgx.Tx) (string, error),
+) (created session.Created, userID string, err error) {
+	ua := r.UserAgent()
+	ip := s.clientIP(r)
+	err = s.auditedTx(r.Context(), ip, func(tx pgx.Tx) (auditRecord, error) {
+		var err error
+		if userID, err = resolve(tx); err != nil {
+			return auditRecord{}, err
+		}
+		if created, err = s.sessions.CreateTx(r.Context(), tx, session.CreateInput{
+			UserID: userID, UserAgent: &ua, IPFirst: &ip,
+		}); err != nil {
+			return auditRecord{}, err
+		}
+		return auditRecord{event: audit.LoginSuccess, actor: userID, detail: detail}, nil
+	})
+	return created, userID, err
+}
+
+// finishLogin emits the session cookie, rotates the CSRF token, and
+// either returns JSON (headless) or redirects to the post-login target.
+// The target comes from an explicit redirect_to form value (headless
+// callers) or the transient cookie captured at GET /login / OAuth start;
+// both go through the same allowlist validation on read.
+//
+// Rotating the CSRF token here is deliberate: a value planted before
+// authentication must not survive the privilege change, and the fresh
+// one is what a headless client needs for POST /logout (it cannot read
+// the HttpOnly cookie itself).
+func (s *Server) finishLogin(w http.ResponseWriter, r *http.Request, created session.Created) {
 	s.setSessionCookie(w, created.Token, created.ExpiresAt)
+	csrf := s.issueCSRFToken(w)
 
 	raw := r.FormValue("redirect_to")
 	if raw == "" {
@@ -562,7 +716,7 @@ func (s *Server) startSessionAndRedirect(w http.ResponseWriter, r *http.Request,
 
 	if wantsJSON(r) {
 		writeJSON(w, http.StatusOK, map[string]string{
-			"status": "authenticated", "redirect_to": target,
+			"status": "authenticated", "redirect_to": target, "csrf_token": csrf,
 		})
 		return
 	}
@@ -591,4 +745,67 @@ func (s *Server) oauthFail(w http.ResponseWriter, r *http.Request, code, msg str
 		return
 	}
 	http.Redirect(w, r, "/login?error="+code, http.StatusFound)
+}
+
+// ── action + evidence atomicity ───────────────────────────────────────
+
+// auditRecord is the evidence an auditedTx action produced. A zero event
+// means "nothing happened worth recording" and no row is written.
+type auditRecord struct {
+	event  audit.Event
+	actor  string
+	detail map[string]any
+}
+
+// auditWriteError wraps a failure of the audit half of an auditedTx.
+// Anti-enumeration callers need to tell it apart from a failure of the
+// action: both must produce the same response to the client, but only
+// one of them deserves an operator-visible warning.
+type auditWriteError struct{ err error }
+
+func (e auditWriteError) Error() string { return "audit write failed: " + e.err.Error() }
+func (e auditWriteError) Unwrap() error { return e.err }
+
+// auditedTx performs a database action and records its evidence with the
+// atomicity the deployment asked for. The action always runs in one
+// transaction, so multi-statement flows (spend token, set password,
+// revoke sessions) can no longer half-apply.
+//
+// Strict mode (SESAMO_AUDIT_STRICT) puts the evidence row in that same
+// transaction: either both land or neither does — no action without
+// evidence, and no evidence for an action that was rolled back. The
+// caller's error response therefore describes a state the client can
+// safely retry.
+//
+// Best-effort mode (the default) commits the action and only then
+// attempts the evidence, swallowing and logging failure exactly as
+// before: availability of the auth path outranks audit completeness. The
+// two modes cannot share one path — Postgres aborts a transaction on any
+// failed statement, so "ignore the audit error" is only expressible
+// outside the transaction.
+func (s *Server) auditedTx(ctx context.Context, ip string, action func(pgx.Tx) (auditRecord, error)) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	rec, err := action(tx)
+	if err != nil {
+		return err
+	}
+	if s.cfg.AuditStrict && rec.event != "" {
+		if err := s.audit.RecordTx(ctx, tx, rec.event, rec.actor, ip, rec.detail); err != nil {
+			return auditWriteError{err: err}
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	if !s.cfg.AuditStrict && rec.event != "" {
+		// Record swallows its own failure here (best-effort mode), so the
+		// discarded error is the documented contract, not an oversight.
+		_ = s.audit.Record(ctx, rec.event, rec.actor, ip, rec.detail)
+	}
+	return nil
 }

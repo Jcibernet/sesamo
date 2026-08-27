@@ -36,9 +36,14 @@ func browserGet(t *testing.T, c *http.Client, rawURL string) (*http.Response, st
 }
 
 // browserPostForm posts form-encoded values with no Accept header,
-// emulating a real <form method="POST"> submission.
-func browserPostForm(t *testing.T, c *http.Client, rawURL string, form url.Values) (*http.Response, string) {
+// emulating a real <form method="POST"> submission. A real submission
+// carries the CSRF token the rendered page embedded, so the helper
+// completes the double-submit handshake against the client's cookie jar
+// first — unless the form already carries its own csrf_token (tests of
+// the rejection path do exactly that).
+func browserPostForm(t *testing.T, h *harness, c *http.Client, rawURL string, form url.Values) (*http.Response, string) {
 	t.Helper()
+	h.withCSRF(c, form)
 	req, err := http.NewRequest(http.MethodPost, rawURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		t.Fatal(err)
@@ -135,7 +140,7 @@ func TestFlow02_ResetConfirmPageDoesNotConsumeToken(t *testing.T) {
 
 	// The GET above must not have burned the single use: the POST below,
 	// reusing the very same token, must still succeed.
-	pres, pbody := browserPostForm(t, c, h.srv.URL+"/reset/confirm", url.Values{
+	pres, pbody := browserPostForm(t, h, c, h.srv.URL+"/reset/confirm", url.Values{
 		"token": {tok}, "password": {"brand-new-flow-pass-2"},
 	})
 	if pres.StatusCode != http.StatusOK {
@@ -152,7 +157,7 @@ func TestFlow03_ResetConfirmInvalidTokenBrowserAndJSON(t *testing.T) {
 	h := newHarness(t)
 
 	c := h.client()
-	res, body := browserPostForm(t, c, h.srv.URL+"/reset/confirm", url.Values{
+	res, body := browserPostForm(t, h, c, h.srv.URL+"/reset/confirm", url.Values{
 		"token": {"garbage-token-does-not-exist"}, "password": {"whatever-valid-pass"},
 	})
 	if res.StatusCode != http.StatusBadRequest {
@@ -205,7 +210,7 @@ func TestFlow05_MagicLinkEmptyEmailBrowserRedirect(t *testing.T) {
 	h := newHarness(t)
 	c := h.client() // CheckRedirect: ErrUseLastResponse — do not follow
 
-	res, _ := browserPostForm(t, c, h.srv.URL+"/magiclink", url.Values{"email": {""}})
+	res, _ := browserPostForm(t, h, c, h.srv.URL+"/magiclink", url.Values{"email": {""}})
 	if res.StatusCode != http.StatusFound {
 		t.Fatalf("browser POST /magiclink empty email: expected 302, got %d", res.StatusCode)
 	}
@@ -262,7 +267,7 @@ func TestFlow07_PasswordLoginRoundTripsRedirect(t *testing.T) {
 		t.Fatalf("GET /login: expected 200, got %d", res.StatusCode)
 	}
 
-	pres, _ := browserPostForm(t, c, h.srv.URL+"/login", url.Values{
+	pres, _ := browserPostForm(t, h, c, h.srv.URL+"/login", url.Values{
 		"email": {emailAddr}, "password": {"correct-horse-flow6"},
 	})
 	if pres.StatusCode != http.StatusFound {
@@ -287,7 +292,7 @@ func TestFlow08_PasswordLoginWithoutRedirectLandsOnRoot(t *testing.T) {
 	h.signup(emailAddr, "correct-horse-flow7")
 	c := h.client()
 
-	pres, _ := browserPostForm(t, c, h.srv.URL+"/login", url.Values{
+	pres, _ := browserPostForm(t, h, c, h.srv.URL+"/login", url.Values{
 		"email": {emailAddr}, "password": {"correct-horse-flow7"},
 	})
 	if pres.StatusCode != http.StatusFound {
@@ -313,7 +318,7 @@ func TestFlow09_HostileRedirectTargetsCollapse(t *testing.T) {
 	} {
 		c := h.client()
 		browserGet(t, c, h.srv.URL+"/login?redirect_to="+url.QueryEscape(hostile))
-		pres, _ := browserPostForm(t, c, h.srv.URL+"/login", url.Values{
+		pres, _ := browserPostForm(t, h, c, h.srv.URL+"/login", url.Values{
 			"email": {emailAddr}, "password": {"correct-horse-flow8"},
 		})
 		if pres.StatusCode != http.StatusFound {
@@ -363,12 +368,12 @@ func TestFlow11_LogoutRedirectsToAllowlistedTarget(t *testing.T) {
 	h.signup(emailAddr, "correct-horse-flow10")
 	c := h.client()
 
-	browserPostForm(t, c, h.srv.URL+"/login", url.Values{
+	browserPostForm(t, h, c, h.srv.URL+"/login", url.Values{
 		"email": {emailAddr}, "password": {"correct-horse-flow10"},
 	})
 
 	target := "http://127.0.0.1:8010/signed-out"
-	res, _ := browserPostForm(t, c, h.srv.URL+"/logout", url.Values{"redirect_to": {target}})
+	res, _ := browserPostForm(t, h, c, h.srv.URL+"/logout", url.Values{"redirect_to": {target}})
 	if res.StatusCode != http.StatusFound {
 		t.Fatalf("POST /logout: expected 302, got %d", res.StatusCode)
 	}
@@ -376,7 +381,7 @@ func TestFlow11_LogoutRedirectsToAllowlistedTarget(t *testing.T) {
 		t.Fatalf("POST /logout: expected redirect to %q, got %q", target, loc)
 	}
 
-	res2, _ := browserPostForm(t, c, h.srv.URL+"/logout", url.Values{"redirect_to": {"https://evil.com/"}})
+	res2, _ := browserPostForm(t, h, c, h.srv.URL+"/logout", url.Values{"redirect_to": {"https://evil.com/"}})
 	if loc := res2.Header.Get("Location"); loc != "/" {
 		t.Fatalf("POST /logout hostile: expected redirect to /, got %q", loc)
 	}

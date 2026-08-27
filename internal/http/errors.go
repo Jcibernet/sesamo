@@ -27,6 +27,7 @@ const (
 	codeInternal           = "internal_error"
 	codeStateMismatch      = "state_mismatch"
 	codeOAuthFailed        = "oauth_failed"
+	codeCSRFFailed         = "csrf_failed"
 )
 
 // writeError emits a JSON apiError with the given status and code.

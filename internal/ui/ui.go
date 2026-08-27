@@ -28,6 +28,9 @@ type LoginData struct {
 	BrandCSS    bool     // link the generated /ui/brand.css
 	LogoURL     string   // optional brand logo rendered atop the card
 	Error       string   // optional error code to surface
+	// CSRFToken is the request half of the double-submit pair; the other
+	// half is the sesamo_csrf cookie set alongside this render.
+	CSRFToken string
 }
 
 // MessageData drives the generic outcome screen (e.g. "check your email").
@@ -56,6 +59,7 @@ type ResetRequestData struct {
 	ThemeCSSURL string
 	BrandCSS    bool
 	LogoURL     string
+	CSRFToken   string
 }
 
 // ResetConfirmData drives the "choose a new password" form page. Token
@@ -67,6 +71,7 @@ type ResetConfirmData struct {
 	BrandCSS    bool
 	LogoURL     string
 	Token       string
+	CSRFToken   string
 }
 
 // RenderResetRequest writes the reset-request form page.

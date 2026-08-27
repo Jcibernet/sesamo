@@ -2,6 +2,7 @@ package http
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -49,6 +50,7 @@ func newHarnessWithConfig(t *testing.T, mutate func(*config.Config)) *harness {
 		CookieName:              "sid",
 		CookieSecure:            false,
 		SessionLifetime:         30 * 24 * time.Hour,
+		SessionMaxLifetime:      90 * 24 * time.Hour,
 		RollingRenewalThreshold: 15 * time.Minute,
 		ServiceToken:            "svc-token-test",
 		AdminAPIKey:             "admin-key-test",
@@ -58,7 +60,10 @@ func newHarnessWithConfig(t *testing.T, mutate func(*config.Config)) *harness {
 	if mutate != nil {
 		mutate(cfg)
 	}
-	h := NewServer(cfg, pool, testLogger())
+	h, err := NewServer(cfg, pool, testLogger())
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
 	srv := httptest.NewServer(h)
 	t.Cleanup(func() { srv.Close(); pool.Close() })
 	return &harness{srv: srv, pool: pool, t: t}
@@ -76,9 +81,10 @@ func (h *harness) client() *http.Client {
 
 func (h *harness) signup(email, password string) {
 	h.t.Helper()
-	res, err := http.PostForm(h.srv.URL+"/signup", url.Values{
-		"email": {email}, "password": {password},
-	})
+	c := h.client()
+	form := url.Values{"email": {email}, "password": {password}}
+	h.withCSRF(c, form)
+	res, err := c.PostForm(h.srv.URL+"/signup", form)
 	if err != nil {
 		h.t.Fatal(err)
 	}
@@ -92,8 +98,38 @@ func uniqueEmail(prefix string) string {
 	return prefix + "-" + crypto.GenerateToken()[:10] + "@test.local"
 }
 
+// withCSRF completes the double-submit handshake for the client's cookie
+// jar: it GETs /login in JSON mode (which sets the sesamo_csrf cookie)
+// and adds the returned token to the form. Callers that need to test
+// broken CSRF hand a form that already carries a csrf_token key — this
+// helper leaves existing values alone.
+func (h *harness) withCSRF(c *http.Client, form url.Values) {
+	h.t.Helper()
+	if form.Has("csrf_token") {
+		return
+	}
+	req, _ := http.NewRequest(http.MethodGet, h.srv.URL+"/login?mode=json", nil)
+	req.Header.Set("Accept", "application/json")
+	res, err := c.Do(req)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	defer res.Body.Close()
+	var payload struct {
+		CSRFToken string `json:"csrf_token"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&payload); err != nil {
+		h.t.Fatalf("csrf bootstrap: %v", err)
+	}
+	if payload.CSRFToken == "" {
+		h.t.Fatal("csrf bootstrap: empty csrf_token")
+	}
+	form.Set("csrf_token", payload.CSRFToken)
+}
+
 // postJSON posts form values, asking for JSON responses (headless).
 func (h *harness) postJSON(c *http.Client, path string, form url.Values) (*http.Response, string) {
+	h.withCSRF(c, form)
 	req, _ := http.NewRequest(http.MethodPost, h.srv.URL+path, strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
@@ -423,8 +459,15 @@ func TestThreat17_XFFSpoofDoesNotBypassIPRateLimit(t *testing.T) {
 	for i := range 30 {
 		email := uniqueEmail(fmt.Sprintf("xff%d", i))
 		emails = append(emails, email)
+		form := url.Values{"email": {email}, "password": {"whatever-bad"}}
+		// A valid CSRF token: the point of this vector is the IP rate
+		// limiter, not CSRF. CSRF rejection would mask the bucket test —
+		// a token-less cross-site flood never reaches checkLoginRate —
+		// so this models the realistic abuser: a headless client that
+		// completed the handshake and now rotates XFF per request.
+		h.withCSRF(c, form)
 		req, _ := http.NewRequest(http.MethodPost, h.srv.URL+"/login",
-			strings.NewReader(url.Values{"email": {email}, "password": {"whatever-bad"}}.Encode()))
+			strings.NewReader(form.Encode()))
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		req.Header.Set("Accept", "application/json")
 		// Spoofed, per-request X-Forwarded-For: if this were honored, each
@@ -568,5 +611,195 @@ func TestThreat20_StrictAuditHealthyLoginUnaffected(t *testing.T) {
 	}
 	if n < 1 {
 		t.Fatal("expected a login.success audit row even in strict mode against a healthy DB")
+	}
+}
+
+// adminPost posts to an admin endpoint with the test admin key.
+func (h *harness) adminPost(path string, form url.Values) (*http.Response, string) {
+	h.t.Helper()
+	req, _ := http.NewRequest(http.MethodPost, h.srv.URL+path, strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Authorization", "Bearer admin-key-test")
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	body, _ := io.ReadAll(res.Body)
+	res.Body.Close()
+	return res, string(body)
+}
+
+// setUserDisabled flips the disabled column directly, for test setup.
+func setUserDisabled(t *testing.T, pool *pgxpool.Pool, userID string, disabled bool) {
+	t.Helper()
+	if _, err := pool.Exec(context.Background(),
+		`UPDATE users SET disabled = $2 WHERE id = $1`, userID, disabled); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// ── Threat vector 21: a cross-site form POST without the CSRF pair is
+// rejected before any credential logic runs (login CSRF) ──────────────
+func TestThreat21_CrossSitePostWithoutTokenRejected(t *testing.T) {
+	h := newHarness(t)
+	email := uniqueEmail("csrf-blast")
+	h.signup(email, "correct-horse-csrf")
+
+	c := h.client()
+	// The attacker's form carries credentials but no token and (here) no
+	// sesamo_csrf cookie: exactly what a forged cross-site POST has.
+	req, _ := http.NewRequest(http.MethodPost, h.srv.URL+"/login",
+		strings.NewReader(url.Values{"email": {email}, "password": {"correct-horse-csrf"}}.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+	res, err := c.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(res.Body)
+	res.Body.Close()
+	if res.StatusCode != http.StatusForbidden {
+		t.Fatalf("tokenless login POST must be 403, got %d (%s)", res.StatusCode, body)
+	}
+	if !strings.Contains(string(body), "csrf_failed") {
+		t.Fatalf("expected csrf_failed code, got: %s", body)
+	}
+	if h.sidCookie(c) != "" {
+		t.Fatal("a CSRF-rejected login must never mint a session cookie")
+	}
+}
+
+// ── Threat vector 22: a headless client that completed the handshake
+// (cookie + token from GET /login JSON) logs in successfully ──────────
+func TestThreat22_CsrfValidPairAccepted(t *testing.T) {
+	h := newHarness(t)
+	email := uniqueEmail("csrf-good")
+	password := "correct-horse-csrf2"
+	h.signup(email, password)
+
+	c := h.client()
+	form := url.Values{"email": {email}, "password": {password}}
+	h.withCSRF(c, form)
+	req, _ := http.NewRequest(http.MethodPost, h.srv.URL+"/login", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+	res, err := c.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(res.Body)
+	res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("valid CSRF pair must log in: got %d (%s)", res.StatusCode, body)
+	}
+	if h.sidCookie(c) == "" {
+		t.Fatal("expected session cookie after a valid CSRF pair")
+	}
+}
+
+// ── Threat vector 23: cookie and token halves that do not match are
+// rejected even when both are present ─────────────────────────────────
+func TestThreat23_CsrfMismatchRejected(t *testing.T) {
+	h := newHarness(t)
+	email := uniqueEmail("csrf-bad")
+	h.signup(email, "correct-horse-csrf3")
+
+	c := h.client()
+	// Bootstrap the cookie, then send a DIFFERENT token in the form.
+	form := url.Values{
+		"email": {email}, "password": {"correct-horse-csrf3"},
+		"csrf_token": {"totally-unrelated-token-value"},
+	}
+	h.withCSRF(c, form)
+	req, _ := http.NewRequest(http.MethodPost, h.srv.URL+"/login", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+	res, err := c.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(res.Body)
+	res.Body.Close()
+	if res.StatusCode != http.StatusForbidden {
+		t.Fatalf("mismatched CSRF pair must be 403, got %d (%s)", res.StatusCode, body)
+	}
+	if h.sidCookie(c) != "" {
+		t.Fatal("a CSRF-mismatched login must never mint a session cookie")
+	}
+}
+
+// ── Threat vector 24: the account kill switch — introspection goes
+// inactive, password login is indistinguishable from bad credentials,
+// the magic link is refused, and re-enable restores access ────────────
+func TestThreat24_DisabledUserKillSwitch(t *testing.T) {
+	h := newHarness(t)
+	email := uniqueEmail("killswitch")
+	password := "correct-horse-kill"
+	h.signup(email, password)
+
+	var userID string
+	if err := h.pool.QueryRow(context.Background(),
+		`SELECT id FROM users WHERE email = $1`, email).Scan(&userID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = h.pool.Exec(context.Background(), `DELETE FROM audit_log WHERE actor_user = $1`, userID)
+	})
+
+	// Live session exists, then the operator pulls the switch.
+	c := h.client()
+	h.postJSON(c, "/login", url.Values{"email": {email}, "password": {password}})
+	sid := h.sidCookie(c)
+	if sid == "" {
+		t.Fatal("expected a live session before disable")
+	}
+	if res, body := h.adminPost("/v1/admin/users/"+userID+"/disable",
+		url.Values{"disabled": {"true"}}); res.StatusCode != http.StatusOK {
+		t.Fatalf("admin disable failed: %d (%s)", res.StatusCode, body)
+	}
+
+	// Existing session: introspect inactive (and the row is gone).
+	if _, b := h.introspect(sid); !strings.Contains(b, `"active":false`) {
+		t.Fatalf("disabled user's session must introspect inactive: %s", b)
+	}
+
+	// New password login: byte-identical to wrong-password (no oracle).
+	cWrong := h.client()
+	_, disabledBody := h.postJSON(cWrong, "/login", url.Values{"email": {email}, "password": {password}})
+	_, badPassBody := h.postJSON(h.client(), "/login", url.Values{"email": {email}, "password": {"wrong-password"}})
+	if disabledBody != badPassBody {
+		t.Fatalf("disabled login must look like bad credentials: %q vs %q", disabledBody, badPassBody)
+	}
+
+	// Magic link: refused with the generic invalid-link answer, and no
+	// session is minted.
+	tok, err := issueRawMagicLinkToken(h.pool, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, _ := browserGet(t, h.client(), h.srv.URL+"/magiclink/confirm?token="+tok)
+	if res.StatusCode == http.StatusFound {
+		t.Fatal("disabled user's magic link must not mint a session")
+	}
+
+	// Re-enable restores logins.
+	if res, body := h.adminPost("/v1/admin/users/"+userID+"/disable",
+		url.Values{"disabled": {"false"}}); res.StatusCode != http.StatusOK {
+		t.Fatalf("admin enable failed: %d (%s)", res.StatusCode, body)
+	}
+	cBack := h.client()
+	if res, body := h.postJSON(cBack, "/login", url.Values{"email": {email}, "password": {password}}); res.StatusCode != http.StatusOK {
+		t.Fatalf("re-enabled user must log in: %d (%s)", res.StatusCode, body)
+	}
+
+	// The kill switch is evidenced in the audit trail.
+	var n int
+	if err := h.pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM audit_log WHERE event = 'user.disabled' AND actor_user = $1`, userID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n < 1 {
+		t.Fatal("expected a user.disabled audit row")
 	}
 }

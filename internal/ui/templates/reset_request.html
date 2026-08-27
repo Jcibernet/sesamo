@@ -14,6 +14,7 @@
     <h1>Restablecer contraseña</h1>
     <p class="sesamo-note sesamo-mb">Ingresá tu email y te enviamos un enlace para elegir una contraseña nueva.</p>
     <form method="POST" action="{{.BaseURL}}/reset">
+      <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
       <div class="sesamo-field">
         <label for="email">Email</label>
         <input id="email" name="email" type="email" autocomplete="email" required>

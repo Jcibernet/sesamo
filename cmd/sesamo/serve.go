@@ -18,7 +18,10 @@ import (
 
 // serve wires the HTTP handler and runs the server until ctx is done.
 func serve(ctx context.Context, cfg *config.Config, pool *db.Pool, log *slog.Logger) error {
-	handler := httpapi.NewServer(cfg, pool, log)
+	handler, err := httpapi.NewServer(cfg, pool, log)
+	if err != nil {
+		return err
+	}
 	go runMaintenance(ctx, cfg, pool, log)
 
 	srv := &http.Server{
@@ -60,6 +63,7 @@ func runMaintenance(ctx context.Context, cfg *config.Config, pool *db.Pool, log 
 	sessions := session.NewStore(pool, session.Config{
 		Lifetime:                cfg.SessionLifetime,
 		RollingRenewalThreshold: cfg.RollingRenewalThreshold,
+		MaxLifetime:             cfg.SessionMaxLifetime,
 	})
 	tokens := email.NewTokenStore(pool)
 	limiter := ratelimit.New(pool)
