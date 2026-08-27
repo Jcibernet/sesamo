@@ -1,7 +1,7 @@
 # Sésamo production image: multi-stage, distroless, static binary.
 # Build:  docker build -t sesamo .
 # Run:    docker run -p 7777:7777 -e SESAMO_DATABASE_URL=... sesamo serve
-FROM golang:1.26 AS build
+FROM golang:1.26.6 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download

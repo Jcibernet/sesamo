@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/big"
 	"net/http"
 	"strings"
@@ -84,7 +85,7 @@ func (c *jwksCache) refresh(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	res, err := http.DefaultClient.Do(req)
+	res, err := outboundHTTPClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("oauth: fetch jwks: %w", err)
 	}
@@ -93,7 +94,7 @@ func (c *jwksCache) refresh(ctx context.Context) error {
 		return fmt.Errorf("oauth: jwks status %d", res.StatusCode)
 	}
 	var set jwkSet
-	if err := json.NewDecoder(res.Body).Decode(&set); err != nil {
+	if err := json.NewDecoder(io.LimitReader(res.Body, 256<<10)).Decode(&set); err != nil {
 		return fmt.Errorf("oauth: decode jwks: %w", err)
 	}
 	parsed := make(map[string]*rsa.PublicKey, len(set.Keys))

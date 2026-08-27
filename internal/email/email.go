@@ -8,8 +8,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"time"
+
+	"github.com/jcibernet/sesamo/internal/httpx"
 )
 
 // Message is a single outbound email.
@@ -23,6 +27,12 @@ type Message struct {
 type Sender interface {
 	Send(ctx context.Context, msg Message) error
 }
+
+const emailResponseMaxBytes = 8 << 10
+
+// outboundHTTPClient bounds transactional-mail calls. A provider outage must
+// consume at most this request's latency budget, never an HTTP handler.
+var outboundHTTPClient = httpx.New(15 * time.Second)
 
 // New builds a Sender from the provider name. Unknown providers fall
 // back to the log sender so dev never hard-fails on email config.
@@ -66,11 +76,12 @@ func (s *resendSender) Send(ctx context.Context, msg Message) error {
 	}
 	req.Header.Set("Authorization", "Bearer "+s.apiKey)
 	req.Header.Set("Content-Type", "application/json")
-	res, err := http.DefaultClient.Do(req)
+	res, err := outboundHTTPClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("resend send: %w", err)
 	}
 	defer res.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(res.Body, emailResponseMaxBytes))
 	if res.StatusCode >= 300 {
 		return fmt.Errorf("resend status %d", res.StatusCode)
 	}
@@ -95,11 +106,12 @@ func (s *postmarkSender) Send(ctx context.Context, msg Message) error {
 	req.Header.Set("X-Postmark-Server-Token", s.apiKey)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	res, err := http.DefaultClient.Do(req)
+	res, err := outboundHTTPClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("postmark send: %w", err)
 	}
 	defer res.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(res.Body, emailResponseMaxBytes))
 	if res.StatusCode >= 300 {
 		return fmt.Errorf("postmark status %d", res.StatusCode)
 	}

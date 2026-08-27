@@ -2,6 +2,8 @@ module github.com/jcibernet/sesamo
 
 go 1.26
 
+toolchain go1.26.6
+
 require (
 	github.com/jackc/pgx/v5 v5.9.2
 	golang.org/x/crypto v0.31.0

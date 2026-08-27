@@ -176,6 +176,7 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 
 	profile, err := prov.Exchange(r.Context(), code, verifier)
 	if err != nil {
+		s.metrics.IncCounter(metricOAuthExchangeErrors)
 		s.log.Warn("oauth exchange failed", "provider", name, "err", err)
 		s.oauthFail(w, r, codeOAuthFailed, "No pudimos iniciar sesión. Probá de nuevo.")
 		return
@@ -470,9 +471,11 @@ func (s *Server) handleResetRequest(w http.ResponseWriter, r *http.Request) {
 		// Evidence before action; on strict-mode audit failure skip the
 		// email but keep the generic 200 — a 500 only for existing
 		// accounts would turn audit outages into an enumeration oracle.
-		if s.audit.Record(r.Context(), audit.ResetRequested, u.ID, s.clientIP(r), nil) == nil {
+		if err := s.audit.Record(r.Context(), audit.ResetRequested, u.ID, s.clientIP(r), nil); err == nil {
 			s.sendOneTimeLink(r, u.ID, emailAddr, email.PurposeReset, "/reset/confirm",
 				"Restablecé tu contraseña", 15*time.Minute)
+		} else {
+			s.metrics.IncCounter(metricAuditWriteErrors)
 		}
 	}
 	if wantsJSON(r) {
@@ -603,9 +606,11 @@ func (s *Server) handleMagicLinkRequest(w http.ResponseWriter, r *http.Request) 
 	// and the response stays identical either way.
 	if err == nil && u != nil && !u.Disabled {
 		// Same enumeration-safe degradation as /reset above.
-		if s.audit.Record(r.Context(), audit.MagicLinkRequest, u.ID, s.clientIP(r), nil) == nil {
+		if err := s.audit.Record(r.Context(), audit.MagicLinkRequest, u.ID, s.clientIP(r), nil); err == nil {
 			s.sendOneTimeLink(r, u.ID, emailAddr, email.PurposeMagicLink, "/magiclink/confirm",
 				"Tu enlace de acceso", 15*time.Minute)
+		} else {
+			s.metrics.IncCounter(metricAuditWriteErrors)
 		}
 	}
 	if wantsJSON(r) {
@@ -733,6 +738,7 @@ func (s *Server) sendOneTimeLink(r *http.Request, userID, to string, purpose ema
 	link := s.cfg.BaseURL + path + "?token=" + token
 	body := subject + ":\n\n" + link + "\n\nEste enlace expira pronto y se usa una sola vez."
 	if err := s.mailer.Send(r.Context(), email.Message{To: to, Subject: subject, Body: body}); err != nil {
+		s.metrics.IncCounter(metricEmailSendErrors)
 		s.log.Error("send email", "err", err)
 	}
 }
@@ -796,6 +802,7 @@ func (s *Server) auditedTx(ctx context.Context, ip string, action func(pgx.Tx) (
 	}
 	if s.cfg.AuditStrict && rec.event != "" {
 		if err := s.audit.RecordTx(ctx, tx, rec.event, rec.actor, ip, rec.detail); err != nil {
+			s.metrics.IncCounter(metricAuditWriteErrors)
 			return auditWriteError{err: err}
 		}
 	}

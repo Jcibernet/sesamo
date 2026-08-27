@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -66,7 +67,7 @@ func (g *GitHub) Exchange(ctx context.Context, code, codeVerifier string) (user.
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
 
-	res, err := http.DefaultClient.Do(req)
+	res, err := outboundHTTPClient.Do(req)
 	if err != nil {
 		return user.OAuthProfile{}, fmt.Errorf("github token exchange: %w", err)
 	}
@@ -77,7 +78,7 @@ func (g *GitHub) Exchange(ctx context.Context, code, codeVerifier string) (user.
 	var tok struct {
 		AccessToken string `json:"access_token"`
 	}
-	if err := json.NewDecoder(res.Body).Decode(&tok); err != nil {
+	if err := json.NewDecoder(io.LimitReader(res.Body, 64<<10)).Decode(&tok); err != nil {
 		return user.OAuthProfile{}, fmt.Errorf("github token decode: %w", err)
 	}
 	if tok.AccessToken == "" {
@@ -101,7 +102,7 @@ func (g *GitHub) fetchUser(ctx context.Context, token string) (user.OAuthProfile
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, githubUserURL, nil)
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Accept", "application/vnd.github+json")
-	res, err := http.DefaultClient.Do(req)
+	res, err := outboundHTTPClient.Do(req)
 	if err != nil {
 		return user.OAuthProfile{}, fmt.Errorf("github user: %w", err)
 	}
@@ -114,7 +115,7 @@ func (g *GitHub) fetchUser(ctx context.Context, token string) (user.OAuthProfile
 		Name      string `json:"name"`
 		AvatarURL string `json:"avatar_url"`
 	}
-	if err := json.NewDecoder(res.Body).Decode(&u); err != nil {
+	if err := json.NewDecoder(io.LimitReader(res.Body, 64<<10)).Decode(&u); err != nil {
 		return user.OAuthProfile{}, fmt.Errorf("github user decode: %w", err)
 	}
 	return user.OAuthProfile{
@@ -129,7 +130,7 @@ func (g *GitHub) fetchPrimaryEmail(ctx context.Context, token string) (string, e
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, githubEmailsURL, nil)
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Accept", "application/vnd.github+json")
-	res, err := http.DefaultClient.Do(req)
+	res, err := outboundHTTPClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("github emails: %w", err)
 	}
@@ -142,7 +143,7 @@ func (g *GitHub) fetchPrimaryEmail(ctx context.Context, token string) (string, e
 		Primary  bool   `json:"primary"`
 		Verified bool   `json:"verified"`
 	}
-	if err := json.NewDecoder(res.Body).Decode(&emails); err != nil {
+	if err := json.NewDecoder(io.LimitReader(res.Body, 64<<10)).Decode(&emails); err != nil {
 		return "", fmt.Errorf("github emails decode: %w", err)
 	}
 	for _, e := range emails {

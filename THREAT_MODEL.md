@@ -51,51 +51,59 @@ names); (4) availability of the introspect hot path.
 | One-time token replay | atomic `UPDATE … RETURNING`, single use | Threat10 |
 | Open redirect after login/logout | `safeRedirectTarget`: internal paths plus the exact-match `SESAMO_REDIRECT_ORIGINS` allowlist; protocol-relative, backslash, userinfo, lookalike-host, and port-mismatch targets collapse to `/` | Threat15, TestSafeRedirectTarget, Flows 07-11 |
 | Session fixation | login always mints a fresh token; `Rotate` on privilege change | session tests |
+| Stolen session kept alive by renewal | `expires_at` renewal is capped at `created_at + SESAMO_SESSION_MAX_LIFETIME_DAYS` (90 days default) | session max-lifetime tests |
 | Rate-limit oversubscription under concurrency | refill+consume in one transaction (row lock) | ratelimit concurrency test |
 
 ### R — Repudiation
 | Threat | Mitigation | Evidence |
 |---|---|---|
-| "I never logged in / that wasn't me" | `audit_log`: login success/fail, signup, logout, resets, verifications, revocations — actor, IP, JSONB detail | Threat18 |
+| "I never logged in / that wasn't me" | `audit_log`: login success/fail, signup, logout, resets, verifications, revocations and account disable/enable — actor, IP, JSONB detail | Threat18, Threat24 |
 | Attacker erases evidence by hanging up | audit insert survives request-context cancellation | `audit.Record` |
 | Secrets leaking into evidence | audit detail carries emails/methods only — never tokens, hashes, passwords | code review rule |
-| Audit outage silently drops evidence | `SESAMO_AUDIT_STRICT`: failed write aborts the operation (no evidence, no action); happy path unaffected | Threat20, audit unit tests |
+| Action without evidence in compliance mode | `SESAMO_AUDIT_STRICT`: password/OAuth/magic login, signup, reset, logout and disable perform their state mutation and audit row in one DB transaction; either both commit or neither does | Threat20, `RecordTx`, store Tx tests |
 
 Deliberately NOT audited: `/v1/introspect` (every protected request; access
 log + metrics cover it). Audit write failures are a configurable tradeoff:
-by default best-effort (a DB failure logs a warning, the auth operation
-proceeds — availability wins); with `SESAMO_AUDIT_STRICT` the operation
-fails instead ("no evidence, no action") for compliance-grade
-deployments. Exception either way: the anti-enumeration endpoints
-(`/reset`, `/magiclink`) degrade silently on strict-mode audit failure —
-the link is not sent but the response stays the generic 200, because a
-500 returned only for existing accounts would turn an audit outage into
-an account-existence oracle.
+by default best-effort (a DB failure logs a warning and the auth operation
+proceeds — availability wins); with `SESAMO_AUDIT_STRICT` the state-changing
+flow rolls back instead. Exception: the anti-enumeration paths (`/reset`,
+`/magiclink`, signup) retain their generic response if strict audit fails, so
+an audit outage cannot become an account-existence oracle.
+
+Residual accepted risk: OAuth user upsert owns its own transaction, then
+session creation plus `login.success` share a second transaction. A strict
+audit failure may therefore leave a newly linked/created OAuth identity
+without a session or `login.success` event. It never creates an active
+session without evidence; eliminating the residual requires moving
+`UpsertByOAuth` into the outer use-case transaction.
 
 ### I — Information disclosure
 | Threat | Mitigation | Evidence |
 |---|---|---|
-| User enumeration via login / reset / signup | identical errors, dummy Argon2id work, always-200 | Threat04-06 |
+| User enumeration via login / reset / signup | identical errors, dummy Argon2id work, always-200 where required | Threat04-06 |
+| Disabled account access | `users.disabled` blocks password, OAuth and magic links; disable revokes every session and introspection returns inactive | Threat24 |
 | Self-service signup on a private deployment | `SESAMO_SIGNUP=disabled`: stable 403 on /signup without touching the DB; OAuth refuses brand-new accounts (`user.ErrSignupDisabled`) while existing users keep logging in; rejections audited as `signup.rejected` | Flow12, TestUpsertRespectsSignupPolicy |
 | Token theft from DB / backups | only SHA-256(token) stored; Argon2id PHC for passwords | schema |
 | XSS exfiltrating the cookie | HttpOnly + strict CSP (no inline scripts) + nosniff | Threat16 |
-| Secrets in logs | logging middleware: no cookies, headers, or bodies | code review rule |
+| Secrets in logs | logging/recovery middleware never logs headers, cookies or bodies; panic value is recorded only by type | code review rule |
 
 ### D — Denial of service
 | Threat | Mitigation | Evidence |
 |---|---|---|
 | Credential-endpoint floods | Postgres-backed token buckets (multi-instance safe) | Threat13 |
 | Oversized request bodies | 64 KiB `MaxBytesReader` on every request | Threat19 |
-| Slow-loris headers | `ReadHeaderTimeout: 10s` | serve.go |
+| Slow POST / slow response / idle connection | `ReadHeaderTimeout` 10 s, `ReadTimeout` + `WriteTimeout` 30 s, `IdleTimeout` 120 s | serve.go |
+| Slow OAuth, JWKS or email provider | bounded shared HTTP client: dial/TLS 5 s, response header 10 s, total 15 s; decoded response caps | `internal/httpx`, provider tests |
+| Handler panic | recovery middleware emits 500 before any output, panic metric, stack and request ID; action transactions roll back | Resilience01 |
 | Unbounded table growth (abandoned sessions, dead tokens, stale buckets — incl. bucket-minting via spoofed keys) | hourly maintenance purge | purge tests |
 | Rate-limiter DB failure locks everyone out | fails OPEN by design — brute-force protection degrades, login stays up. Accepted: a DB brownout weakens throttling exactly when checks are slowest; per-identity Argon2id cost still applies | ratelimit.go comment |
 
 ### E — Elevation of privilege
 | Threat | Mitigation | Evidence |
 |---|---|---|
-| Service token used on admin API | separate keys, both constant-time | Threat11, Threat12 |
-| CSRF logout / state-changing GETs | POST-only mutations + SameSite=Lax | Threat14 |
-| Login CSRF | SameSite=Lax cookies; forms are `form-action 'self'` under CSP | Threat16 |
+| Service token used on admin API | separate keys, both constant-time; production requires distinct 32+ character values | Threat11, Threat12 |
+| CSRF logout / state-changing GETs | POST-only mutations + CSRF double-submit token | Threat14, Threat21-23 |
+| Login CSRF | `sesamo_csrf` HttpOnly cookie must match form `csrf_token` or `X-CSRF-Token`, constant-time; SameSite=Lax/CSP remain defense in depth | Threat21-23 |
 | Unconfigured admin API | 503 when `SESAMO_ADMIN_API_KEY` empty — no fallback key | admin.go |
 
 ## 3. What are we going to do about it?

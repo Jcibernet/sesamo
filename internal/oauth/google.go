@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -74,7 +75,7 @@ func (g *Google) Exchange(ctx context.Context, code, codeVerifier string) (user.
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	res, err := http.DefaultClient.Do(req)
+	res, err := outboundHTTPClient.Do(req)
 	if err != nil {
 		return user.OAuthProfile{}, fmt.Errorf("google token exchange: %w", err)
 	}
@@ -86,7 +87,7 @@ func (g *Google) Exchange(ctx context.Context, code, codeVerifier string) (user.
 	var tok struct {
 		IDToken string `json:"id_token"`
 	}
-	if err := json.NewDecoder(res.Body).Decode(&tok); err != nil {
+	if err := json.NewDecoder(io.LimitReader(res.Body, 64<<10)).Decode(&tok); err != nil {
 		return user.OAuthProfile{}, fmt.Errorf("google token decode: %w", err)
 	}
 	if tok.IDToken == "" {
