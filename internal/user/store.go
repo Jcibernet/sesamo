@@ -42,6 +42,13 @@ type UpsertResult struct {
 // (linked or matched by email) are unaffected.
 var ErrSignupDisabled = errors.New("signup disabled: new user creation is not allowed")
 
+// ErrUserDisabled is returned by UpsertByOAuth when the profile resolves
+// to an account whose kill switch is on. The provider already vouched
+// for the identity, so this is an authorization outcome, not an
+// authentication one: callers must answer with their generic login
+// failure and start no session.
+var ErrUserDisabled = errors.New("user disabled: login is not allowed")
+
 // UpsertByOAuth resolves a user from an OAuth profile. It links by
 // (provider, provider_sub) first; if no identity exists it links to an
 // existing user by email, or — only when allowCreate — creates a new
@@ -53,12 +60,23 @@ func (s *Store) UpsertByOAuth(ctx context.Context, p OAuthProfile, allowCreate b
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	// 1. Existing identity?
-	var userID string
-	err = tx.QueryRow(ctx,
-		`SELECT user_id FROM identities WHERE provider = $1 AND provider_sub = $2`,
-		p.Provider, p.Sub).Scan(&userID)
+	// 1. Existing identity? Resolve the owner and its kill switch in one
+	// round trip: a disabled account must not even get its profile
+	// fields refreshed.
+	var (
+		userID   string
+		disabled bool
+	)
+	err = tx.QueryRow(ctx, `
+		SELECT i.user_id, u.disabled
+		FROM identities i
+		JOIN users u ON u.id = i.user_id
+		WHERE i.provider = $1 AND i.provider_sub = $2`,
+		p.Provider, p.Sub).Scan(&userID, &disabled)
 	if err == nil {
+		if disabled {
+			return UpsertResult{}, ErrUserDisabled
+		}
 		// Refresh mutable profile fields.
 		if _, err := tx.Exec(ctx,
 			`UPDATE users SET name = $2, picture_url = $3, updated_at = now() WHERE id = $1`,
@@ -74,9 +92,11 @@ func (s *Store) UpsertByOAuth(ctx context.Context, p OAuthProfile, allowCreate b
 		return UpsertResult{}, err
 	}
 
-	// 2. Existing user by email? Link a new identity to it.
+	// 2. Existing user by email? Link a new identity to it — unless it is
+	// disabled, in which case linking would hand the account back.
 	isNew := false
-	err = tx.QueryRow(ctx, `SELECT id FROM users WHERE email = $1`, p.Email).Scan(&userID)
+	err = tx.QueryRow(ctx, `SELECT id, disabled FROM users WHERE email = $1`, p.Email).
+		Scan(&userID, &disabled)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// 3. Create a new user.
 		if !allowCreate {
@@ -92,6 +112,8 @@ func (s *Store) UpsertByOAuth(ctx context.Context, p OAuthProfile, allowCreate b
 		isNew = true
 	} else if err != nil {
 		return UpsertResult{}, err
+	} else if disabled {
+		return UpsertResult{}, ErrUserDisabled
 	}
 
 	// Link the identity.
@@ -112,9 +134,10 @@ func (s *Store) UpsertByOAuth(ctx context.Context, p OAuthProfile, allowCreate b
 func (s *Store) ByID(ctx context.Context, id string) (*User, error) {
 	var u User
 	err := s.pool.QueryRow(ctx,
-		`SELECT id, email, email_verified, name, picture_url, created_at, metadata
+		`SELECT id, email, email_verified, disabled, name, picture_url, created_at, metadata
 		 FROM users WHERE id = $1`, id).
-		Scan(&u.ID, &u.Email, &u.EmailVerified, &u.Name, &u.PictureURL, &u.CreatedAt, &u.Metadata)
+		Scan(&u.ID, &u.Email, &u.EmailVerified, &u.Disabled,
+			&u.Name, &u.PictureURL, &u.CreatedAt, &u.Metadata)
 	if err != nil {
 		return nil, err
 	}
@@ -125,9 +148,10 @@ func (s *Store) ByID(ctx context.Context, id string) (*User, error) {
 func (s *Store) ByEmail(ctx context.Context, email string) (*User, error) {
 	var u User
 	err := s.pool.QueryRow(ctx,
-		`SELECT id, email, email_verified, name, picture_url, created_at, metadata
+		`SELECT id, email, email_verified, disabled, name, picture_url, created_at, metadata
 		 FROM users WHERE email = $1`, email).
-		Scan(&u.ID, &u.Email, &u.EmailVerified, &u.Name, &u.PictureURL, &u.CreatedAt, &u.Metadata)
+		Scan(&u.ID, &u.Email, &u.EmailVerified, &u.Disabled,
+			&u.Name, &u.PictureURL, &u.CreatedAt, &u.Metadata)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}

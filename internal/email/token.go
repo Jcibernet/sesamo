@@ -66,14 +66,34 @@ func (s *TokenStore) Issue(ctx context.Context, userID string, purpose Purpose, 
 // ErrInvalidToken is returned when a token is missing, expired, or used.
 var ErrInvalidToken = errors.New("invalid or expired token")
 
+// executor is the subset of *pgxpool.Pool and pgx.Tx the store needs, so
+// the single-use UPDATE lives exactly once and the pooled and
+// transactional entry points cannot drift apart.
+type executor interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
 // Consume atomically validates and marks a token used, returning the
 // associated user id. A token can be consumed at most once.
 func (s *TokenStore) Consume(ctx context.Context, token string, purpose Purpose) (string, error) {
+	return consume(ctx, s.pool, token, purpose)
+}
+
+// ConsumeTx is Consume inside a caller-owned transaction, so spending
+// the token and everything the caller does with the result — the session
+// row, the evidence row — commit or roll back together. Rolling back
+// un-spends the token: the emailed link stays usable, which is the point
+// (the alternative is a user locked out by a failed audit write).
+func (s *TokenStore) ConsumeTx(ctx context.Context, tx pgx.Tx, token string, purpose Purpose) (string, error) {
+	return consume(ctx, tx, token, purpose)
+}
+
+func consume(ctx context.Context, ex executor, token string, purpose Purpose) (string, error) {
 	hash := crypto.HashToken(token)
 	var userID string
 	// Single UPDATE ... RETURNING guarantees atomic single-use: the row
 	// is only returned if it was still unconsumed and unexpired.
-	err := s.pool.QueryRow(ctx,
+	err := ex.QueryRow(ctx,
 		`UPDATE one_time_tokens
 		   SET consumed_at = now()
 		 WHERE token_hash = $1

@@ -3,6 +3,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -14,14 +15,27 @@ import (
 
 // Config is the fully-resolved runtime configuration.
 type Config struct {
+	// Env selects the deployment profile. EnvDevelopment (default) keeps
+	// the permissive local defaults — http, insecure cookie, stdout
+	// mailer, plaintext Postgres — that make local dev painless.
+	// EnvProduction turns every one of them into a boot failure
+	// (validateProduction): a misconfigured auth server that starts is
+	// worse than one that refuses to.
+	Env string
+
 	DatabaseURL string
 	BaseURL     string
 	ListenAddr  string
 
-	CookieName              string
-	CookieSecure            bool
-	CookieDomain            string
-	SessionLifetime         time.Duration
+	CookieName      string
+	CookieSecure    bool
+	CookieDomain    string
+	SessionLifetime time.Duration
+	// SessionMaxLifetime is the absolute ceiling on a session's age,
+	// counted from creation: rolling renewal may extend expires_at up to
+	// this bound and no further. Without it an active client — or a
+	// stolen cookie replayed once per renewal window — lives forever.
+	SessionMaxLifetime      time.Duration
 	RollingRenewalThreshold time.Duration
 
 	ServiceToken string
@@ -83,6 +97,31 @@ const (
 	SignupDisabled = "disabled"
 )
 
+// Env values for Config.Env.
+const (
+	EnvDevelopment = "development"
+	EnvProduction  = "production"
+)
+
+// defaultSessionMaxLifetimeDays is the absolute session cap applied when
+// SESAMO_SESSION_MAX_LIFETIME_DAYS is unset (or nonsense in dev).
+const defaultSessionMaxLifetimeDays = 90
+
+// productionSecretMinLen is the minimum length of the service token and
+// the admin API key in production. Both are bearer secrets guarding
+// introspection and user administration; the generated values the README
+// recommends (openssl rand -base64 32) clear this, "changeme" does not.
+const productionSecretMinLen = 32
+
+// productionSSLModes are the sslmode values that actually encrypt the
+// Postgres connection. "prefer" and "allow" negotiate down to plaintext
+// without a word, which is why an explicit mode is required.
+var productionSSLModes = map[string]bool{
+	"require":     true,
+	"verify-ca":   true,
+	"verify-full": true,
+}
+
 // OAuthProviderConfig holds the standard client_id/secret/redirect set.
 type OAuthProviderConfig struct {
 	ClientID     string
@@ -114,6 +153,7 @@ func (a AppleConfig) Enabled() bool {
 // validating that required fields are present.
 func Load() (*Config, error) {
 	c := &Config{
+		Env:           getenv("SESAMO_ENV", EnvDevelopment),
 		DatabaseURL:   getenv("SESAMO_DATABASE_URL", ""),
 		BaseURL:       getenv("SESAMO_BASE_URL", "http://localhost:7777"),
 		ListenAddr:    getenv("SESAMO_LISTEN_ADDR", ":7777"),
@@ -154,12 +194,40 @@ func Load() (*Config, error) {
 			RedirectURI: getenv("SESAMO_APPLE_REDIRECT_URI", ""),
 		},
 	}
+	if c.Env != EnvDevelopment && c.Env != EnvProduction {
+		return nil, fmt.Errorf("SESAMO_ENV: must be %q or %q, got %q",
+			EnvDevelopment, EnvProduction, c.Env)
+	}
+	prod := c.Env == EnvProduction
 
-	days := getint("SESAMO_SESSION_LIFETIME_DAYS", 30)
+	// Integer env vars stay dev-silent (a typo keeps the default) but
+	// production collects the parse failures: silently running with a
+	// 30-day session when the operator asked for 1 is a security bug.
+	var intErrs []error
+	days, err := getint("SESAMO_SESSION_LIFETIME_DAYS", 30)
+	if err != nil {
+		intErrs = append(intErrs, err)
+	}
 	c.SessionLifetime = time.Duration(days) * 24 * time.Hour
-	mins := getint("SESAMO_ROLLING_RENEWAL_THRESHOLD_MINUTES", 15)
+	mins, err := getint("SESAMO_ROLLING_RENEWAL_THRESHOLD_MINUTES", 15)
+	if err != nil {
+		intErrs = append(intErrs, err)
+	}
 	c.RollingRenewalThreshold = time.Duration(mins) * time.Minute
-	if rd := getint("SESAMO_AUDIT_RETENTION_DAYS", 0); rd > 0 {
+	maxDays, err := getint("SESAMO_SESSION_MAX_LIFETIME_DAYS", defaultSessionMaxLifetimeDays)
+	if err != nil {
+		intErrs = append(intErrs, err)
+	}
+	if !prod && maxDays <= 0 {
+		// The cap is a safety net, not a dev-time obstacle: locally an
+		// absent or nonsense value falls back to the default instead of
+		// producing sessions that expire the instant they are created.
+		maxDays = defaultSessionMaxLifetimeDays
+	}
+	c.SessionMaxLifetime = time.Duration(maxDays) * 24 * time.Hour
+	// Retention keeps its historical best-effort parsing: 0 (keep
+	// forever) is the safe reading of a broken value.
+	if rd, _ := getint("SESAMO_AUDIT_RETENTION_DAYS", 0); rd > 0 {
 		c.AuditRetention = time.Duration(rd) * 24 * time.Hour
 	}
 
@@ -180,6 +248,20 @@ func Load() (*Config, error) {
 
 	if c.DatabaseURL == "" {
 		return nil, fmt.Errorf("SESAMO_DATABASE_URL is required")
+	}
+
+	// Session invariant, both environments: a cap shorter than one
+	// session lifetime would expire sessions before their first renewal.
+	if c.SessionMaxLifetime < c.SessionLifetime {
+		return nil, fmt.Errorf(
+			"SESAMO_SESSION_MAX_LIFETIME_DAYS (%s) must be >= SESAMO_SESSION_LIFETIME_DAYS (%s)",
+			c.SessionMaxLifetime, c.SessionLifetime)
+	}
+
+	if prod {
+		if probs := c.validateProduction(intErrs); len(probs) > 0 {
+			return nil, fmt.Errorf("SESAMO_ENV=production: %w", errors.Join(probs...))
+		}
 	}
 	return c, nil
 }
@@ -209,6 +291,158 @@ func parseRedirectOrigins(raw string) ([]string, error) {
 	return origins, nil
 }
 
+// envField pairs an env var name with its resolved value so error
+// messages can name the variable the operator has to fix.
+type envField struct {
+	name  string
+	value string
+}
+
+// validateProduction returns every production invariant this Config
+// violates. All of them are collected before returning: an operator
+// promoting a dev deployment fixes one list instead of restarting into
+// the next surprise. intErrs carries the integer parse failures
+// development tolerates.
+func (c *Config) validateProduction(intErrs []error) []error {
+	probs := append([]error(nil), intErrs...)
+
+	if !strings.HasPrefix(c.BaseURL, "https://") {
+		probs = append(probs, fmt.Errorf(
+			"SESAMO_BASE_URL: must start with https:// in production, got %q", c.BaseURL))
+	}
+	if !c.CookieSecure {
+		probs = append(probs, errors.New(
+			"SESAMO_COOKIE_SECURE: must be true in production (a session cookie sent over http is a session handed over)"))
+	}
+
+	for _, f := range []envField{
+		{"SESAMO_SERVICE_TOKEN", c.ServiceToken},
+		{"SESAMO_ADMIN_API_KEY", c.AdminAPIKey},
+	} {
+		switch {
+		case f.value == "":
+			probs = append(probs, fmt.Errorf("%s: required in production", f.name))
+		case len(f.value) < productionSecretMinLen:
+			probs = append(probs, fmt.Errorf("%s: must be at least %d characters in production, got %d",
+				f.name, productionSecretMinLen, len(f.value)))
+		}
+	}
+	if c.ServiceToken != "" && c.ServiceToken == c.AdminAPIKey {
+		probs = append(probs, errors.New(
+			"SESAMO_SERVICE_TOKEN and SESAMO_ADMIN_API_KEY: must differ (otherwise every introspect caller also holds admin rights)"))
+	}
+
+	if c.EmailProvider != "resend" && c.EmailProvider != "postmark" {
+		probs = append(probs, fmt.Errorf(
+			"SESAMO_EMAIL_PROVIDER: must be \"resend\" or \"postmark\" in production, got %q (the \"log\" provider prints reset links to stdout instead of sending them)",
+			c.EmailProvider))
+	}
+	if c.EmailAPIKey == "" {
+		probs = append(probs, errors.New("SESAMO_EMAIL_API_KEY: required in production"))
+	}
+	if c.EmailFrom == "" || strings.Contains(strings.ToLower(c.EmailFrom), "localhost") {
+		probs = append(probs, fmt.Errorf(
+			"SESAMO_EMAIL_FROM: must be a deliverable sender address in production, got %q", c.EmailFrom))
+	}
+
+	probs = appendNonNil(probs,
+		checkOAuthBlock("google", []envField{
+			{"SESAMO_GOOGLE_CLIENT_ID", c.Google.ClientID},
+			{"SESAMO_GOOGLE_CLIENT_SECRET", c.Google.ClientSecret},
+			{"SESAMO_GOOGLE_REDIRECT_URI", c.Google.RedirectURI},
+		}),
+		checkOAuthBlock("github", []envField{
+			{"SESAMO_GITHUB_CLIENT_ID", c.GitHub.ClientID},
+			{"SESAMO_GITHUB_CLIENT_SECRET", c.GitHub.ClientSecret},
+			{"SESAMO_GITHUB_REDIRECT_URI", c.GitHub.RedirectURI},
+		}),
+		checkOAuthBlock("apple", []envField{
+			{"SESAMO_APPLE_CLIENT_ID", c.Apple.ClientID},
+			{"SESAMO_APPLE_TEAM_ID", c.Apple.TeamID},
+			{"SESAMO_APPLE_KEY_ID", c.Apple.KeyID},
+			{"SESAMO_APPLE_PRIVATE_KEY", c.Apple.PrivateKey},
+			{"SESAMO_APPLE_REDIRECT_URI", c.Apple.RedirectURI},
+		}),
+	)
+
+	switch mode := dsnSSLMode(c.DatabaseURL); {
+	case mode == "":
+		probs = append(probs, errors.New(
+			"SESAMO_DATABASE_URL: sslmode is required in production (use require, verify-ca, or verify-full); without it libpq/pgx default to \"prefer\", which silently falls back to plaintext"))
+	case !productionSSLModes[mode]:
+		probs = append(probs, fmt.Errorf(
+			"SESAMO_DATABASE_URL: sslmode=%s does not guarantee an encrypted connection; use require, verify-ca, or verify-full", mode))
+	}
+
+	if c.SessionLifetime <= 0 {
+		probs = append(probs, errors.New("SESAMO_SESSION_LIFETIME_DAYS: must be > 0 in production"))
+	}
+	if c.RollingRenewalThreshold <= 0 {
+		probs = append(probs, errors.New("SESAMO_ROLLING_RENEWAL_THRESHOLD_MINUTES: must be > 0 in production"))
+	}
+	if c.SessionMaxLifetime <= 0 {
+		probs = append(probs, errors.New("SESAMO_SESSION_MAX_LIFETIME_DAYS: must be > 0 in production"))
+	}
+	return probs
+}
+
+// appendNonNil appends only the non-nil errors, keeping the call sites
+// that produce one-error-or-nil checks free of nil guards.
+func appendNonNil(dst []error, errs ...error) []error {
+	for _, err := range errs {
+		if err != nil {
+			dst = append(dst, err)
+		}
+	}
+	return dst
+}
+
+// checkOAuthBlock enforces all-or-nothing on one provider's env block.
+// A half-configured provider is simply not registered at runtime
+// (Enabled() is false), so in production it shows up as a login button
+// that vanished — or worse, an OAuth flow the operator believes is live.
+// Boot loudly instead of guessing intent.
+func checkOAuthBlock(provider string, fields []envField) error {
+	var set, missing []string
+	for _, f := range fields {
+		if f.value == "" {
+			missing = append(missing, f.name)
+		} else {
+			set = append(set, f.name)
+		}
+	}
+	if len(set) == 0 || len(missing) == 0 {
+		return nil
+	}
+	return fmt.Errorf("OAuth %s is partially configured: %s set, %s missing (set all of them or none)",
+		provider, strings.Join(set, ", "), strings.Join(missing, ", "))
+}
+
+// dsnSSLMode extracts the sslmode parameter from a Postgres DSN, in both
+// the URL and the keyword/value form pgx accepts. We parse it by hand
+// instead of using pgconn.ParseConfig because that function resolves the
+// mode into a *tls.Config and applies its own default, so the one thing
+// we need to know — whether the operator stated a mode at all — is no
+// longer observable. PGSSLMODE is honored as a fallback because pgx
+// honors it too. Returns "" when no mode is stated anywhere.
+func dsnSSLMode(dsn string) string {
+	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
+		if u, err := url.Parse(dsn); err == nil {
+			if mode := strings.TrimSpace(u.Query().Get("sslmode")); mode != "" {
+				return mode
+			}
+		}
+	} else {
+		// Keyword/value DSN: "host=db port=5432 sslmode=require".
+		for _, pair := range strings.Fields(dsn) {
+			if k, v, ok := strings.Cut(pair, "="); ok && k == "sslmode" {
+				return strings.TrimSpace(v)
+			}
+		}
+	}
+	return strings.TrimSpace(os.Getenv("PGSSLMODE"))
+}
+
 func getenv(key, def string) string {
 	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
 		return v
@@ -228,16 +462,19 @@ func getbool(key string, def bool) bool {
 	return b
 }
 
-func getint(key string, def int) int {
+// getint reads an integer env var. An unset var yields def with no
+// error; a malformed one yields def AND an error, so development can
+// keep booting on a typo while production refuses to.
+func getint(key string, def int) (int, error) {
 	v := strings.TrimSpace(os.Getenv(key))
 	if v == "" {
-		return def
+		return def, nil
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil {
-		return def
+		return def, fmt.Errorf("%s: %q is not an integer", key, v)
 	}
-	return n
+	return n, nil
 }
 
 // BrandConfig is the no-code branding layer (Auth0 "basic branding"

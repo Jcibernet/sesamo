@@ -1,0 +1,246 @@
+name: Release
+
+# Tag-driven release: `git tag v1.2.3 && git push --tags`.
+#
+# The tag name is the single source of truth for the version. It is stamped
+# into the binary via -ldflags "-X main.version=..." (see `sesamo version`)
+# and passed to the image build as --build-arg VERSION, so a running
+# container, a downloaded binary and the GitHub Release all report the
+# same string.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # create the release, upload assets
+  packages: write # push the image to GHCR
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Test
+        # Release smoke test, deliberately without SESAMO_TEST_DB: the
+        # DB-backed suites skip cleanly and a skip is NOT a failure here.
+        # ci.yml is the gate that runs them against a real Postgres and
+        # treats a skip as red; by the time a tag exists that has already
+        # passed on the same commit. What this step protects against is
+        # tagging a commit that no longer builds or breaks a unit test.
+        run: go test ./...
+
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+            ext: ".exe"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Build
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          VERSION: ${{ github.ref_name }}
+          EXT: ${{ matrix.ext }}
+        # Pure-Go build (CGO_ENABLED=0): one static binary per platform, no
+        # libc to match at runtime. -trimpath keeps build paths out of the
+        # artifact so the same tag produces the same bytes anywhere.
+        run: |
+          set -euo pipefail
+          name="sesamo_${VERSION}_${GOOS}_${GOARCH}"
+          mkdir -p "dist/${name}"
+          go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" \
+            -o "dist/${name}/sesamo${EXT}" ./cmd/sesamo
+
+      - name: Package
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          name="sesamo_${VERSION}_${GOOS}_${GOARCH}"
+          cd dist
+          if [ "$GOOS" = "windows" ]; then
+            zip -qr "${name}.zip" "${name}"
+          else
+            tar -czf "${name}.tar.gz" "${name}"
+          fi
+          rm -rf "${name}"
+          ls -l
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: sesamo_${{ matrix.goos }}_${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: sesamo_*
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        # One SHA256SUMS for every archive, verifiable with
+        # `sha256sum -c SHA256SUMS`. Also echoed to the run summary so the
+        # digests are readable without downloading anything.
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum sesamo_*.tar.gz sesamo_*.zip > SHA256SUMS
+          {
+            echo "### Release artifacts"
+            echo
+            echo '```'
+            cat SHA256SUMS
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            dist/SHA256SUMS dist/sesamo_*.tar.gz dist/sesamo_*.zip
+
+  docker:
+    name: Publish image
+    # After the release exists, so the SBOM can be attached to it.
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # arm64 is built under emulation; amd64 runs natively.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            VERSION=${{ github.ref_name }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Image digest
+        # The digest is what you pin in production; the tag is a moving
+        # label. Printed to the summary so a deploy can copy it verbatim.
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          {
+            echo "### Image"
+            echo
+            echo '```'
+            echo "ghcr.io/${GITHUB_REPOSITORY}@${DIGEST}"
+            echo '```'
+            echo
+            echo "Tags:"
+            echo
+            echo '```'
+            echo "${TAGS}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: SBOM
+        # Generated from the pushed image by digest, so it describes exactly
+        # the bytes that were published. Uploaded as a run artifact by the
+        # action itself (artifact-name) and attached to the release below.
+        uses: anchore/sbom-action@v0
+        with:
+          image: ghcr.io/${{ github.repository }}@${{ steps.push.outputs.digest }}
+          format: spdx-json
+          output-file: sesamo_${{ github.ref_name }}.spdx.json
+          artifact-name: sesamo_${{ github.ref_name }}.spdx.json
+
+      - name: Attach SBOM to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release upload "$GITHUB_REF_NAME" \
+            "sesamo_${GITHUB_REF_NAME}.spdx.json" \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Scan image
+        # Gate, deliberately last: the image and its SBOM are already
+        # published, so a CRITICAL finding fails the run loudly with the
+        # evidence attached instead of leaving nothing to inspect. Pull the
+        # tag, do not promote it, fix, re-tag.
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ghcr.io/${{ github.repository }}@${{ steps.push.outputs.digest }}
+          format: table
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"

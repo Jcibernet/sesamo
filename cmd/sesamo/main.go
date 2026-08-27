@@ -7,6 +7,7 @@
 //	sesamo migrate   run idempotent migrations and exit
 //	sesamo serve     run migrations then start the HTTP server
 //	sesamo admin ... administrative commands (e.g. import)
+//	sesamo version   print the build version and exit
 package main
 
 import (
@@ -21,11 +22,18 @@ import (
 	"github.com/jcibernet/sesamo/internal/db"
 )
 
+// version is the build version, stamped at link time with
+//
+//	-ldflags "-X main.version=v1.2.3"
+//
+// Unstamped builds (go run, go build without flags) report "dev".
+var version = "dev"
+
 func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: sesamo <migrate|serve|admin>")
+		fmt.Fprintln(os.Stderr, "usage: sesamo <migrate|serve|admin|version>")
 		os.Exit(2)
 	}
 
@@ -37,6 +45,9 @@ func main() {
 		os.Exit(runServe(log))
 	case "admin":
 		os.Exit(runAdmin(log, os.Args[2:]))
+	case "version":
+		fmt.Println(version)
+		os.Exit(0)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n", cmd)
 		os.Exit(2)

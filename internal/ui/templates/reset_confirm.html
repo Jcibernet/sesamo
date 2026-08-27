@@ -14,6 +14,7 @@
     <h1>Elegí una contraseña nueva</h1>
     <form method="POST" action="{{.BaseURL}}/reset/confirm">
       <input type="hidden" name="token" value="{{.Token}}">
+      <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
       <div class="sesamo-field">
         <label for="password">Nueva contraseña</label>
         <input id="password" name="password" type="password" autocomplete="new-password" minlength="8" required>

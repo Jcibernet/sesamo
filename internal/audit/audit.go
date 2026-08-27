@@ -18,6 +18,8 @@ import (
 	"net"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -36,6 +38,8 @@ const (
 	MagicLinkRequest   Event = "magiclink.requested"
 	SessionRevoked     Event = "session.revoked"
 	SessionsRevokedAll Event = "sessions.revoked_all"
+	UserDisabled       Event = "user.disabled"
+	UserEnabled        Event = "user.enabled"
 )
 
 // writeTimeout bounds the audit insert so a slow database cannot stall
@@ -67,6 +71,28 @@ func New(pool *pgxpool.Pool, log *slog.Logger, strict bool) *Logger {
 // it is the write/marshal failure and the caller MUST abort the
 // operation it was about to evidence.
 func (l *Logger) Record(ctx context.Context, event Event, actorUser, ip string, detail map[string]any) error {
+	return l.record(ctx, l.pool, event, actorUser, ip, detail)
+}
+
+// RecordTx is Record inside a caller-owned transaction: the evidence row
+// and the action it evidences commit — or roll back — together. This is
+// what makes strict mode actually strict, rather than "action committed,
+// then evidence attempted".
+//
+// Best-effort mode intentionally keeps using Record: swallowing a write
+// failure inside a transaction would poison it (Postgres aborts the
+// whole tx on a failed statement), so the action would be rolled back by
+// the very outage best-effort mode exists to survive.
+func (l *Logger) RecordTx(ctx context.Context, tx pgx.Tx, event Event, actorUser, ip string, detail map[string]any) error {
+	return l.record(ctx, tx, event, actorUser, ip, detail)
+}
+
+// executor is the subset of *pgxpool.Pool and pgx.Tx the insert needs.
+type executor interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
+func (l *Logger) record(ctx context.Context, ex executor, event Event, actorUser, ip string, detail map[string]any) error {
 	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), writeTimeout)
 	defer cancel()
 
@@ -91,7 +117,7 @@ func (l *Logger) Record(ctx context.Context, event Event, actorUser, ip string, 
 		}
 	}
 
-	if _, err := l.pool.Exec(dctx, `
+	if _, err := ex.Exec(dctx, `
 		INSERT INTO audit_log (actor_user, event, ip, detail)
 		VALUES ($1, $2, $3::inet, $4::jsonb)`,
 		actor, string(event), ipArg, string(detailJSON)); err != nil {

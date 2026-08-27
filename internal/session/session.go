@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/jcibernet/sesamo/internal/crypto"
@@ -20,6 +21,12 @@ import (
 type Config struct {
 	Lifetime                time.Duration
 	RollingRenewalThreshold time.Duration
+	// MaxLifetime is the absolute cap on a session's life, measured from
+	// its creation: rolling renewal can never push expires_at past
+	// created_at+MaxLifetime, so a stolen-and-kept-warm cookie still
+	// dies. Zero disables the cap (renew forever), the historical
+	// behavior.
+	MaxLifetime time.Duration
 }
 
 // Kind enumerates validation outcomes.
@@ -69,15 +76,34 @@ type Created struct {
 	ExpiresAt time.Time
 }
 
+// executor is the subset of *pgxpool.Pool and pgx.Tx the store needs, so
+// each statement lives exactly once and the pooled and transactional
+// entry points cannot drift apart.
+type executor interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
 // Create inserts a new session and returns the raw token. The raw token
 // is never persisted; only its SHA-256 hash is stored.
 func (s *Store) Create(ctx context.Context, in CreateInput) (Created, error) {
+	return s.create(ctx, s.pool, in)
+}
+
+// CreateTx is Create inside a caller-owned transaction: the session row
+// commits — or rolls back — together with everything else the caller
+// does in tx (in strict audit mode, the evidence row).
+func (s *Store) CreateTx(ctx context.Context, tx pgx.Tx, in CreateInput) (Created, error) {
+	return s.create(ctx, tx, in)
+}
+
+func (s *Store) create(ctx context.Context, ex executor, in CreateInput) (Created, error) {
 	token := crypto.GenerateToken()
 	idHash := crypto.HashToken(token)
 	now := time.Now().UTC()
 	expiresAt := now.Add(s.cfg.Lifetime)
 
-	_, err := s.pool.Exec(ctx, `
+	_, err := ex.Exec(ctx, `
 		INSERT INTO sessions
 			(id_hash, user_id, created_at, last_used_at, expires_at, user_agent, ip_first)
 		VALUES ($1, $2, $3, $3, $4, $5, $6)`,
@@ -90,13 +116,15 @@ func (s *Store) Create(ctx context.Context, in CreateInput) (Created, error) {
 
 // Validate looks up a session by raw token. On a live session past the
 // rolling threshold it extends last_used_at + expires_at (one write per
-// threshold window, not per request). Expired sessions are deleted
-// opportunistically.
+// threshold window, not per request), never past the absolute
+// created_at+MaxLifetime cap. Expired sessions — and sessions whose
+// owner has been disabled — are deleted opportunistically.
 func (s *Store) Validate(ctx context.Context, token string) (Result, error) {
 	idHash := crypto.HashToken(token)
 
 	var (
 		userID    string
+		createdAt time.Time
 		expiresAt time.Time
 		lastUsed  time.Time
 		u         user.User
@@ -104,15 +132,15 @@ func (s *Store) Validate(ctx context.Context, token string) (Result, error) {
 		picture   *string
 	)
 	err := s.pool.QueryRow(ctx, `
-		SELECT s.user_id, s.expires_at, s.last_used_at,
+		SELECT s.user_id, s.created_at, s.expires_at, s.last_used_at,
 		       u.id, u.email, u.email_verified, u.name, u.picture_url,
-		       u.created_at, u.metadata
+		       u.created_at, u.metadata, u.disabled
 		FROM sessions s
 		JOIN users u ON u.id = s.user_id
 		WHERE s.id_hash = $1`, idHash).
-		Scan(&userID, &expiresAt, &lastUsed,
+		Scan(&userID, &createdAt, &expiresAt, &lastUsed,
 			&u.ID, &u.Email, &u.EmailVerified, &name, &picture,
-			&u.CreatedAt, &u.Metadata)
+			&u.CreatedAt, &u.Metadata, &u.Disabled)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return Result{Kind: KindNotFound}, nil
@@ -123,7 +151,10 @@ func (s *Store) Validate(ctx context.Context, token string) (Result, error) {
 	u.PictureURL = picture
 
 	now := time.Now().UTC()
-	if !expiresAt.After(now) {
+	// A disabled account's live sessions die on next use. Same outcome as
+	// expiry for every caller, and the row goes away so a stolen cookie
+	// cannot outlive the disable even if the flag is later cleared.
+	if u.Disabled || !expiresAt.After(now) {
 		_, _ = s.pool.Exec(ctx, `DELETE FROM sessions WHERE id_hash = $1`, idHash)
 		return Result{Kind: KindExpired}, nil
 	}
@@ -131,14 +162,29 @@ func (s *Store) Validate(ctx context.Context, token string) (Result, error) {
 	renewed := false
 	if now.Sub(lastUsed) >= s.cfg.RollingRenewalThreshold {
 		newExpiry := now.Add(s.cfg.Lifetime)
-		_, err := s.pool.Exec(ctx, `
-			UPDATE sessions SET last_used_at = $2, expires_at = $3
-			WHERE id_hash = $1`, idHash, now, newExpiry)
-		if err != nil {
-			return Result{}, err
+		if s.cfg.MaxLifetime > 0 {
+			if limit := createdAt.Add(s.cfg.MaxLifetime); newExpiry.After(limit) {
+				newExpiry = limit
+			}
 		}
-		expiresAt = newExpiry
-		renewed = true
+		if newExpiry.After(expiresAt) {
+			if _, err := s.pool.Exec(ctx, `
+				UPDATE sessions SET last_used_at = $2, expires_at = $3
+				WHERE id_hash = $1`, idHash, now, newExpiry); err != nil {
+				return Result{}, err
+			}
+			expiresAt = newExpiry
+			renewed = true
+		} else {
+			// Pinned against the absolute cap: no extension to make, but
+			// still record the touch so the renewal window does not retry
+			// this branch on every subsequent request.
+			if _, err := s.pool.Exec(ctx, `
+				UPDATE sessions SET last_used_at = $2 WHERE id_hash = $1`,
+				idHash, now); err != nil {
+				return Result{}, err
+			}
+		}
 	}
 
 	return Result{Kind: KindValid, User: &u, ExpiresAt: expiresAt, Renewed: renewed}, nil
@@ -157,9 +203,18 @@ func (s *Store) Rotate(ctx context.Context, oldToken string, in CreateInput) (Cr
 // Revoke deletes a single session by raw token and returns the user id
 // it belonged to ("" when the token matched nothing). Idempotent.
 func (s *Store) Revoke(ctx context.Context, token string) (string, error) {
+	return revoke(ctx, s.pool, token)
+}
+
+// RevokeTx is Revoke inside a caller-owned transaction.
+func (s *Store) RevokeTx(ctx context.Context, tx pgx.Tx, token string) (string, error) {
+	return revoke(ctx, tx, token)
+}
+
+func revoke(ctx context.Context, ex executor, token string) (string, error) {
 	idHash := crypto.HashToken(token)
 	var userID string
-	err := s.pool.QueryRow(ctx,
+	err := ex.QueryRow(ctx,
 		`DELETE FROM sessions WHERE id_hash = $1 RETURNING user_id`, idHash).Scan(&userID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", nil
@@ -169,7 +224,16 @@ func (s *Store) Revoke(ctx context.Context, token string) (string, error) {
 
 // RevokeAllForUser deletes every session for a user ("log out everywhere").
 func (s *Store) RevokeAllForUser(ctx context.Context, userID string) error {
-	_, err := s.pool.Exec(ctx, `DELETE FROM sessions WHERE user_id = $1`, userID)
+	return revokeAllForUser(ctx, s.pool, userID)
+}
+
+// RevokeAllForUserTx is RevokeAllForUser inside a caller-owned transaction.
+func (s *Store) RevokeAllForUserTx(ctx context.Context, tx pgx.Tx, userID string) error {
+	return revokeAllForUser(ctx, tx, userID)
+}
+
+func revokeAllForUser(ctx context.Context, ex executor, userID string) error {
+	_, err := ex.Exec(ctx, `DELETE FROM sessions WHERE user_id = $1`, userID)
 	return err
 }
 

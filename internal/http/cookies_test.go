@@ -30,8 +30,9 @@ func TestCookieDomainAttr(t *testing.T) {
 			},
 		}
 
-		req, _ := http.NewRequest(http.MethodPost, h.srv.URL+"/login",
-			strings.NewReader(url.Values{"email": {email}, "password": {"correct-horse-1"}}.Encode()))
+		form := url.Values{"email": {email}, "password": {"correct-horse-1"}}
+		h.withCSRF(c, form)
+		req, _ := http.NewRequest(http.MethodPost, h.srv.URL+"/login", strings.NewReader(form.Encode()))
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		res, err := c.Do(req)
 		if err != nil {
@@ -63,8 +64,9 @@ func TestCookieDomainAttr(t *testing.T) {
 			},
 		}
 
-		req, _ := http.NewRequest(http.MethodPost, h.srv.URL+"/login",
-			strings.NewReader(url.Values{"email": {email}, "password": {"correct-horse-2"}}.Encode()))
+		form := url.Values{"email": {email}, "password": {"correct-horse-2"}}
+		h.withCSRF(c, form)
+		req, _ := http.NewRequest(http.MethodPost, h.srv.URL+"/login", strings.NewReader(form.Encode()))
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		res, err := c.Do(req)
 		if err != nil {
@@ -103,8 +105,9 @@ func TestSessionCookieSecurityFlags(t *testing.T) {
 			return http.ErrUseLastResponse
 		},
 	}
-	req, _ := http.NewRequest(http.MethodPost, h.srv.URL+"/login",
-		strings.NewReader(url.Values{"email": {email}, "password": {"correct-horse-3"}}.Encode()))
+	form := url.Values{"email": {email}, "password": {"correct-horse-3"}}
+	h.withCSRF(c, form)
+	req, _ := http.NewRequest(http.MethodPost, h.srv.URL+"/login", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	res, err := c.Do(req)
 	if err != nil {

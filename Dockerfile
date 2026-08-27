@@ -6,7 +6,12 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /sesamo ./cmd/sesamo
+
+# Build version, stamped into the binary (sesamo version). Declared here,
+# after the dependency layers, so changing it does not invalidate the
+# go mod download cache. Release builds pass --build-arg VERSION=vX.Y.Z.
+ARG VERSION=dev
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /sesamo ./cmd/sesamo
 
 # Distroless static: no shell, no libc, no package manager — the binary
 # and CA certs, nothing else. Runs as nonroot (uid 65532).
