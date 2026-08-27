@@ -16,6 +16,15 @@ import (
 	"github.com/jcibernet/sesamo/internal/session"
 )
 
+const (
+	// Bound every phase after headers too: ReadHeaderTimeout alone does not
+	// stop a slow POST that trickles fewer than maxBodyBytes forever.
+	serverReadHeaderTimeout = 10 * time.Second
+	serverReadTimeout       = 30 * time.Second
+	serverWriteTimeout      = 30 * time.Second
+	serverIdleTimeout       = 120 * time.Second
+)
+
 // serve wires the HTTP handler and runs the server until ctx is done.
 func serve(ctx context.Context, cfg *config.Config, pool *db.Pool, log *slog.Logger) error {
 	handler, err := httpapi.NewServer(cfg, pool, log)
@@ -27,7 +36,10 @@ func serve(ctx context.Context, cfg *config.Config, pool *db.Pool, log *slog.Log
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           handler,
-		ReadHeaderTimeout: 10 * time.Second,
+		ReadHeaderTimeout: serverReadHeaderTimeout,
+		ReadTimeout:       serverReadTimeout,
+		WriteTimeout:      serverWriteTimeout,
+		IdleTimeout:       serverIdleTimeout,
 	}
 
 	errc := make(chan error, 1)

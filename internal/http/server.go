@@ -4,9 +4,13 @@ package http
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -39,6 +43,13 @@ type Server struct {
 	brandCSS  []byte // generated /ui/brand.css (nil when branding unset)
 	csp       string // precomputed Content-Security-Policy value
 }
+
+const (
+	metricHTTPPanics          = "sesamo_http_panics_total"
+	metricOAuthExchangeErrors = "sesamo_oauth_exchange_errors_total"
+	metricEmailSendErrors     = "sesamo_email_send_errors_total"
+	metricAuditWriteErrors    = "sesamo_audit_write_errors_total"
+)
 
 // NewServer builds the full handler tree. It returns an error when a
 // configured dependency cannot be constructed — an OAuth provider the
@@ -75,7 +86,7 @@ func NewServer(cfg *config.Config, pool *db.Pool, log *slog.Logger) (http.Handle
 	s.registerService() // /v1/introspect, /v1/sessions/revoke
 	s.registerAdmin()   // /v1/admin/*
 
-	return s.withSecurityHeaders(s.withLogging(s.withBodyLimit(s.mux))), nil
+	return s.withSecurityHeaders(s.withRequestID(s.withLogging(s.withRecover(s.withBodyLimit(s.mux))))), nil
 }
 
 // buildProviders registers exactly the OAuth providers the operator
@@ -143,7 +154,9 @@ func (s *Server) registerOps() {
 	})
 	s.mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-		_, _ = w.Write([]byte(s.metrics.WritePrometheus()))
+		st := s.pool.Stat()
+		_, _ = fmt.Fprintf(w, "%s# TYPE sesamo_db_pool_acquired gauge\nsesamo_db_pool_acquired %d\n# TYPE sesamo_db_pool_idle gauge\nsesamo_db_pool_idle %d\n# TYPE sesamo_db_pool_max gauge\nsesamo_db_pool_max %d\n",
+			s.metrics.WritePrometheus(), st.AcquiredConns(), st.IdleConns(), st.MaxConns())
 	})
 }
 
@@ -163,16 +176,97 @@ func (s *Server) withSecurityHeaders(next http.Handler) http.Handler {
 	})
 }
 
+type requestIDContextKey struct{}
+
+const requestIDHeader = "X-Request-Id"
+
+// withRequestID makes each access-log, panic record, and caller response
+// correlate without trusting arbitrary inbound header bytes.
+func (s *Server) withRequestID(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id := validRequestID(r.Header.Get(requestIDHeader))
+		if id == "" {
+			id = newRequestID()
+		}
+		w.Header().Set(requestIDHeader, id)
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), requestIDContextKey{}, id)))
+	})
+}
+
+func validRequestID(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || len(raw) > 128 {
+		return ""
+	}
+	for i := range len(raw) {
+		if raw[i] < 0x21 || raw[i] > 0x7e {
+			return ""
+		}
+	}
+	return raw
+}
+
+func newRequestID() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err == nil {
+		return hex.EncodeToString(b[:])
+	}
+	// Request IDs are diagnostic correlation values, not credentials. A
+	// time-derived fallback is still preferable to dropping correlation if
+	// the kernel RNG is temporarily unavailable.
+	return fmt.Sprintf("fallback-%x", time.Now().UnixNano())
+}
+
+func requestID(r *http.Request) string {
+	id, _ := r.Context().Value(requestIDContextKey{}).(string)
+	return id
+}
+
+// withRecover prevents a panic in one request from silently severing its
+// connection. It deliberately does not continue an interrupted handler:
+// database operations remain governed by their transaction rollback.
+func (s *Server) withRecover(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			recovered := recover()
+			if recovered == nil {
+				return
+			}
+			if err, ok := recovered.(error); ok && err == http.ErrAbortHandler {
+				panic(recovered)
+			}
+			stack := debug.Stack()
+			if len(stack) > 16<<10 {
+				stack = stack[:16<<10]
+			}
+			s.metrics.IncCounter(metricHTTPPanics)
+			s.log.Error("panic recovered",
+				"method", r.Method,
+				"path", r.URL.Path,
+				"req_id", requestID(r),
+				"panic_type", fmt.Sprintf("%T", recovered),
+				"stack", string(stack),
+			)
+			if recorder, ok := w.(*statusRecorder); !ok || !recorder.wroteHeader {
+				writeError(w, http.StatusInternalServerError, codeInternal, "Error interno.")
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+
 // withLogging is a structured access log middleware that never logs
 // secrets (no cookies, no auth headers, no bodies).
 func (s *Server) withLogging(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		rw := &statusRecorder{ResponseWriter: w, status: 200}
+		rw := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(rw, r)
 		elapsed := time.Since(start)
 
 		s.metrics.IncCounter("sesamo_http_requests_total")
+		s.metrics.IncCounter("sesamo_http_requests_total_" + statusClass(rw.status))
+		s.metrics.Observe("sesamo_request_duration_seconds", elapsed.Seconds())
 		// Latency of the introspect hot path is the SLO we care about.
 		if r.URL.Path == "/v1/introspect" {
 			s.metrics.Observe("sesamo_introspect_duration_seconds", elapsed.Seconds())
@@ -184,18 +278,46 @@ func (s *Server) withLogging(next http.Handler) http.Handler {
 			"status", rw.status,
 			"dur_ms", elapsed.Milliseconds(),
 			"ip", s.clientIP(r),
+			"req_id", requestID(r),
 		)
 	})
 }
 
+func statusClass(status int) string {
+	switch {
+	case status >= 200 && status < 300:
+		return "2xx"
+	case status >= 300 && status < 400:
+		return "3xx"
+	case status >= 400 && status < 500:
+		return "4xx"
+	case status >= 500 && status < 600:
+		return "5xx"
+	default:
+		return "other"
+	}
+}
+
 type statusRecorder struct {
 	http.ResponseWriter
-	status int
+	status      int
+	wroteHeader bool
 }
 
 func (r *statusRecorder) WriteHeader(code int) {
+	if r.wroteHeader {
+		return
+	}
 	r.status = code
+	r.wroteHeader = true
 	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *statusRecorder) Write(p []byte) (int, error) {
+	if !r.wroteHeader {
+		r.WriteHeader(http.StatusOK)
+	}
+	return r.ResponseWriter.Write(p)
 }
 
 // maxBodyBytes caps request bodies. Every legitimate body Sésamo accepts
@@ -225,6 +347,7 @@ func (s *Server) withBodyLimit(next http.Handler) http.Handler {
 // Record's error themselves and degrade silently.
 func (s *Server) recordAudit(w http.ResponseWriter, r *http.Request, e audit.Event, actorUser string, detail map[string]any) bool {
 	if err := s.audit.Record(r.Context(), e, actorUser, s.clientIP(r), detail); err != nil {
+		s.metrics.IncCounter(metricAuditWriteErrors)
 		writeError(w, http.StatusInternalServerError, codeInternal, "Error interno.")
 		return false
 	}

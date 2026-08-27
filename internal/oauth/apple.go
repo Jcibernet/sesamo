@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -94,7 +95,7 @@ func (a *Apple) Exchange(ctx context.Context, code, codeVerifier string) (user.O
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	res, err := http.DefaultClient.Do(req)
+	res, err := outboundHTTPClient.Do(req)
 	if err != nil {
 		return user.OAuthProfile{}, fmt.Errorf("apple token exchange: %w", err)
 	}
@@ -105,7 +106,7 @@ func (a *Apple) Exchange(ctx context.Context, code, codeVerifier string) (user.O
 	var tok struct {
 		IDToken string `json:"id_token"`
 	}
-	if err := json.NewDecoder(res.Body).Decode(&tok); err != nil {
+	if err := json.NewDecoder(io.LimitReader(res.Body, 64<<10)).Decode(&tok); err != nil {
 		return user.OAuthProfile{}, fmt.Errorf("apple token decode: %w", err)
 	}
 	if tok.IDToken == "" {

@@ -8,9 +8,15 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"time"
 
+	"github.com/jcibernet/sesamo/internal/httpx"
 	"github.com/jcibernet/sesamo/internal/user"
 )
+
+// outboundHTTPClient bounds every provider exchange and JWKS refresh.
+// Sharing it is safe: http.Client and its transport are concurrency-safe.
+var outboundHTTPClient = httpx.New(15 * time.Second)
 
 // Provider is the common contract for an OAuth identity provider.
 type Provider interface {
