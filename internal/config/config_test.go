@@ -230,7 +230,7 @@ func prodEnv() map[string]string {
 		"SESAMO_EMAIL_API_KEY":                     "re_live_deadbeef",
 		"SESAMO_EMAIL_FROM":                        "auth@example.com",
 		"SESAMO_EMAIL_OUTBOX_KEYS":                 "k1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
-		"SESAMO_RESEND_WEBHOOK_SECRET":             "",
+		"SESAMO_RESEND_WEBHOOK_SECRET":             "whsec_test-secret",
 		"SESAMO_PROJECT_SLUG":                      "",
 		"SESAMO_PROJECT_DISPLAY_NAME":              "",
 		"SESAMO_SESSION_LIFETIME_DAYS":             "30",
@@ -419,6 +419,11 @@ func TestLoad_ProductionInvariants(t *testing.T) {
 			name: "zero max lifetime rejected",
 			env:  map[string]string{"SESAMO_SESSION_MAX_LIFETIME_DAYS": "0"},
 			want: []string{"SESAMO_SESSION_MAX_LIFETIME_DAYS"},
+		},
+		{
+			name: "resend webhook secret required",
+			env:  map[string]string{"SESAMO_RESEND_WEBHOOK_SECRET": ""},
+			want: []string{"SESAMO_RESEND_WEBHOOK_SECRET"},
 		},
 		{
 			name: "every violation is reported at once",

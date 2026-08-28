@@ -96,8 +96,9 @@ type descriptorEndpoint struct {
 // Auth values for descriptorEndpoint.Auth. Absent means unauthenticated
 // (or authenticated by the session cookie the flow itself issues).
 const (
-	authServiceToken = "bearer_service_token"
-	authAdminKey     = "bearer_admin_api_key"
+	authServiceToken  = "bearer_service_token"
+	authAdminKey      = "bearer_admin_api_key"
+	authSvixSignature = "svix_signature"
 )
 
 // descriptorEndpoints is the full route map, as a struct rather than a
@@ -117,9 +118,9 @@ type descriptorEndpoints struct {
 	Reset               descriptorEndpoint `json:"reset"`
 	ResetConfirmPage    descriptorEndpoint `json:"reset_confirm_page"`
 	ResetConfirm        descriptorEndpoint `json:"reset_confirm"`
-	Verify              descriptorEndpoint `json:"verify"`
 	MagicLink           descriptorEndpoint `json:"magiclink"`
 	MagicLinkConfirm    descriptorEndpoint `json:"magiclink_confirm"`
+	ResendWebhook       descriptorEndpoint `json:"resend_webhook"`
 	Introspect          descriptorEndpoint `json:"introspect"`
 	RevokeSession       descriptorEndpoint `json:"revoke_session"`
 	AdminUser           descriptorEndpoint `json:"admin_user"`
@@ -133,8 +134,9 @@ type descriptorEndpoints struct {
 }
 
 type descriptorCapabilities struct {
-	Password  bool `json:"password"`
-	MagicLink bool `json:"magic_link"`
+	Password             bool `json:"password"`
+	MagicLink            bool `json:"magic_link"`
+	EmailDeliveryWebhook bool `json:"email_delivery_webhook"`
 	// OAuthProviders lists only the providers this deployment actually
 	// registered — a half-configured provider never boots (buildProviders),
 	// so presence here means the flow works.
@@ -192,11 +194,10 @@ func buildDescriptor(cfg *config.Config, oauthProviders []string) descriptorDoc 
 			Reset:               descriptorEndpoint{Method: "POST", Path: "/reset"},
 			ResetConfirmPage:    descriptorEndpoint{Method: "GET", Path: "/reset/confirm"},
 			ResetConfirm:        descriptorEndpoint{Method: "POST", Path: "/reset/confirm"},
-			Verify:              descriptorEndpoint{Method: "GET", Path: "/verify"},
 			MagicLink:           descriptorEndpoint{Method: "POST", Path: "/magiclink"},
 			MagicLinkConfirm:    descriptorEndpoint{Method: "GET", Path: "/magiclink/confirm"},
+			ResendWebhook:       descriptorEndpoint{Method: "POST", Path: "/v1/webhooks/resend", Auth: authSvixSignature},
 			Introspect:          descriptorEndpoint{Method: "POST", Path: "/v1/introspect", Auth: authServiceToken},
-			RevokeSession:       descriptorEndpoint{Method: "POST", Path: "/v1/sessions/revoke", Auth: authServiceToken},
 			AdminUser:           descriptorEndpoint{Method: "GET", Path: "/v1/admin/users/{id}", Auth: authAdminKey},
 			AdminRevokeSessions: descriptorEndpoint{Method: "POST", Path: "/v1/admin/users/{id}/revoke-sessions", Auth: authAdminKey},
 			AdminDisable:        descriptorEndpoint{Method: "POST", Path: "/v1/admin/users/{id}/disable", Auth: authAdminKey},
@@ -207,10 +208,11 @@ func buildDescriptor(cfg *config.Config, oauthProviders []string) descriptorDoc 
 			LLMs:                descriptorEndpoint{Method: "GET", Path: "/llms.txt"},
 		},
 		Capabilities: descriptorCapabilities{
-			Password:       true,
-			MagicLink:      true,
-			OAuthProviders: providers,
-			Signup:         cfg.Signup,
+			Password:             true,
+			MagicLink:            true,
+			EmailDeliveryWebhook: cfg.ResendWebhookSecret != "",
+			OAuthProviders:       providers,
+			Signup:               cfg.Signup,
 		},
 		Session: descriptorSession{
 			CookieName:              cfg.CookieName,
@@ -514,6 +516,27 @@ const openAPISpec = `{
           "200": { "$ref": "#/components/responses/SessionEstablished" },
           "303": { "description": "Redirección al destino post-login." },
           "400": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/webhooks/resend": {
+      "post": {
+        "tags": ["ops"],
+        "summary": "Registra eventos de entrega de Resend.",
+        "description": "Callback público autenticado por firma Svix. Disponible solo cuando SESAMO_RESEND_WEBHOOK_SECRET está configurado; consultar capabilities.email_delivery_webhook.",
+        "parameters": [
+          { "name": "svix-id", "in": "header", "required": true, "schema": { "type": "string" } },
+          { "name": "svix-timestamp", "in": "header", "required": true, "schema": { "type": "string" } },
+          { "name": "svix-signature", "in": "header", "required": true, "schema": { "type": "string" } }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "type": "object" } } }
+        },
+        "responses": {
+          "200": { "$ref": "#/components/responses/Status" },
+          "400": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
         }
       }
     },
