@@ -23,6 +23,11 @@ const (
 	serverReadTimeout       = 30 * time.Second
 	serverWriteTimeout      = 30 * time.Second
 	serverIdleTimeout       = 120 * time.Second
+
+	// The worker stops claiming on cancellation but may finish one send
+	// (20s) and its durable Finalize (5s). Keep the process and pool alive
+	// long enough to record that acceptance before exit.
+	shutdownTimeout = 30 * time.Second
 )
 
 // serve wires the HTTP handler and runs the server until ctx is done.
@@ -34,7 +39,12 @@ func serve(ctx context.Context, cfg *config.Config, pool *db.Pool, log *slog.Log
 	// The email worker runs in-process, one per replica: jobs are
 	// partitioned by lease, so scaling replicas scales delivery without
 	// duplicating mail. It shares the server's outbox and metrics.
-	go api.EmailWorker().Run(ctx)
+	workerCtx, stopWorker := context.WithCancel(ctx)
+	workerDone := make(chan struct{})
+	go func() {
+		defer close(workerDone)
+		api.EmailWorker().Run(workerCtx)
+	}()
 	go runMaintenance(ctx, cfg, pool, log, api.EmailOutbox())
 
 	srv := &http.Server{
@@ -56,10 +66,30 @@ func serve(ctx context.Context, cfg *config.Config, pool *db.Pool, log *slog.Log
 
 	select {
 	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		return srv.Shutdown(shutdownCtx)
+		httpShutdownCtx, cancelHTTP := context.WithTimeout(context.Background(), shutdownTimeout)
+
+		// Stop accepting HTTP work first, then drain the one email delivery
+		// that can be in flight. Closing the pool before the worker exits
+		// loses provider acceptance and causes a duplicate after lease
+		// recovery (notably with Postmark, which has no idempotency key).
+		shutdownErr := srv.Shutdown(httpShutdownCtx)
+		cancelHTTP()
+
+		workerShutdownCtx, cancelWorkerWait := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancelWorkerWait()
+		stopWorker()
+		select {
+		case <-workerDone:
+		case <-workerShutdownCtx.Done():
+			return workerShutdownCtx.Err()
+		}
+		if errors.Is(shutdownErr, context.DeadlineExceeded) {
+			log.Warn("HTTP shutdown grace elapsed")
+			return nil
+		}
+		return shutdownErr
 	case err := <-errc:
+		stopWorker()
 		return err
 	}
 }

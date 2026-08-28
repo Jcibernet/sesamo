@@ -26,7 +26,7 @@ func runDescribe(log *slog.Logger, args []string) int {
 		}
 	}
 
-	cfg, err := config.Load()
+	cfg, err := config.LoadForDescribe()
 	if err != nil {
 		log.Error("config", "err", err)
 		return 1

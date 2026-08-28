@@ -16,13 +16,21 @@ const (
 	pollInterval = 2 * time.Second
 
 	// claimBatch bounds how many jobs one cycle leases. Sends are
-	// sequential, so a batch must be deliverable well inside LeaseDuration.
-	claimBatch = 10
+	// sequential, each delivery receives sendTimeout plus finalizeTimeout,
+	// and the full batch MUST complete inside the two-minute lease (4 ×
+	// 25s = 100s, leaving a 20s margin).
+	claimBatch = 4
 
 	// sendTimeout bounds one provider call. The shared outbound client
 	// already caps the HTTP operation; this also covers the retry-free
 	// body read and keeps a shutdown bounded.
 	sendTimeout = 20 * time.Second
+
+	// finalizeTimeout is deliberately independent from sendTimeout. A
+	// provider acceptance at the end of its budget still needs enough DB
+	// time to persist the outcome, or a later lease reclaim can duplicate
+	// delivery with providers that lack idempotency support.
+	finalizeTimeout = 5 * time.Second
 
 	// statsInterval throttles the queue-health sample: gauges do not need
 	// to be refreshed on every poll.
@@ -113,13 +121,16 @@ func (w *Worker) runOnce(ctx context.Context) int {
 func (w *Worker) deliver(ctx context.Context, job Job) {
 	// Detached from ctx on purpose (see Run): an in-flight send must
 	// finish and be recorded even while the process is shutting down.
-	sendCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sendTimeout)
-	defer cancel()
-
+	sendCtx, cancelSend := context.WithTimeout(context.WithoutCancel(ctx), sendTimeout)
 	receipt, err := w.sender.Send(sendCtx, job.Message, job.IdempotencyKey())
+	cancelSend()
 	out := w.classify(job, receipt, err)
 
-	if ferr := w.outbox.Finalize(sendCtx, job.ID, job.LeaseToken, out); ferr != nil {
+	// Do not spend the tail of the provider's timeout on the durable
+	// acknowledgement. The lease budget accounts for both phases.
+	finalizeCtx, cancelFinalize := context.WithTimeout(context.WithoutCancel(ctx), finalizeTimeout)
+	defer cancelFinalize()
+	if ferr := w.outbox.Finalize(finalizeCtx, job.ID, job.LeaseToken, out); ferr != nil {
 		if errors.Is(ferr, ErrLeaseLost) {
 			// Our lease expired and someone else owns this job now. Their
 			// outcome stands; ours is dropped deliberately.

@@ -172,8 +172,19 @@ func (a AppleConfig) Enabled() bool {
 }
 
 // Load reads configuration from the environment, applying defaults and
-// validating that required fields are present.
+// validating every requirement needed to run the server.
 func Load() (*Config, error) {
+	return load(true)
+}
+
+// LoadForDescribe validates the public deployment contract without requiring
+// a database DSN. `sesamo describe` never opens a pool, so demanding a secret
+// it cannot use contradicts its container-inspection use case.
+func LoadForDescribe() (*Config, error) {
+	return load(false)
+}
+
+func load(requireDatabase bool) (*Config, error) {
 	c := &Config{
 		Env:                 getenv("SESAMO_ENV", EnvDevelopment),
 		ProjectSlug:         getenv("SESAMO_PROJECT_SLUG", "sesamo"),
@@ -278,7 +289,7 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
-	if c.DatabaseURL == "" {
+	if requireDatabase && c.DatabaseURL == "" {
 		return nil, fmt.Errorf("SESAMO_DATABASE_URL is required")
 	}
 
@@ -384,6 +395,10 @@ func (c *Config) validateProduction(intErrs []error) []error {
 	if c.EmailOutboxKeys == "" {
 		probs = append(probs, errors.New(
 			"SESAMO_EMAIL_OUTBOX_KEYS: required in production (queued email payloads embed bearer links and are encrypted at rest; see .env.example)"))
+	}
+	if c.EmailProvider == "resend" && c.ResendWebhookSecret == "" {
+		probs = append(probs, errors.New(
+			"SESAMO_RESEND_WEBHOOK_SECRET: required in production with SESAMO_EMAIL_PROVIDER=resend (delivery failures must reach the outbox)"))
 	}
 
 	probs = appendNonNil(probs,
