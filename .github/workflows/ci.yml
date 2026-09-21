@@ -1,0 +1,118 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: sesamo
+          POSTGRES_PASSWORD: sesamo
+          POSTGRES_DB: sesamo_dev
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U sesamo -d sesamo_dev"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # Dev database connection parts. The DSN is assembled at runtime (see
+      # the "Compose test DSN" step) so the security-critical, DB-backed
+      # tests actually run instead of skipping. These are the disposable dev
+      # credentials, identical to docker-compose.yml — not a real secret.
+      PGHOST: localhost
+      PGPORT: "5432"
+      PGUSER: sesamo
+      PGPASSWORD: sesamo
+      PGDATABASE: sesamo_dev
+      # Shared CI runners are slower than a dev box; loosen the latency SLO
+      # so the load test's correctness guard still runs without flaking on
+      # perf. Local runs keep the strict default (p50<5ms / p99<20ms).
+      SESAMO_LOAD_P50_MAX_MS: "50"
+      SESAMO_LOAD_P99_MAX_MS: "200"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.6"
+          cache: true
+
+      - name: Compose test DSN
+        # Built from parts so no user:pass@host string is hardcoded in YAML.
+        run: |
+          echo "SESAMO_TEST_DB=postgres://${PGUSER}:${PGPASSWORD}@${PGHOST}:${PGPORT}/${PGDATABASE}?sslmode=disable" >> "$GITHUB_ENV"
+
+      - name: Verify formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-clean:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Apply migrations
+        run: |
+          go build -o sesamo ./cmd/sesamo
+          SESAMO_DATABASE_URL="$SESAMO_TEST_DB" ./sesamo migrate
+
+      - name: Test (with database)
+        # -count=1 disables the test cache so DB-backed tests always execute.
+        # The whole point of the Postgres service above is that nothing skips
+        # for want of a database, so a SKIP is treated as a red build.
+        run: |
+          set -o pipefail
+          go test -count=1 -v ./... 2>&1 | tee test.out
+          if grep -q -- '--- SKIP' test.out; then
+            echo "::error::Some tests were skipped; the DB-backed suite must run in full."
+            grep -- '--- SKIP' test.out
+            exit 1
+          fi
+
+      - name: Test (race)
+        # Second pass over the same suite, same database, under the race
+        # detector: the session store, the rolling-renewal path and the
+        # introspection handler are all concurrent, so a data race there is a
+        # security bug, not a style issue.
+        #
+        # TestLoadIntrospect is skipped here (and only here): the detector
+        # inflates per-request latency by an order of magnitude, which trips
+        # the p50/p99 SLO the load test asserts. The step above runs it
+        # unskipped, so coverage is not lost.
+        run: go test -race -count=1 -skip TestLoadIntrospect ./...
+
+      - name: Install govulncheck
+        # CI-only tool. Installed with `go install pkg@version`, which never
+        # touches go.mod, so the dependency allowlist (pgx + x/crypto) stays
+        # intact.
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: Vulnerability scan
+        # Fails the build when a known vulnerability is reachable from our
+        # code (govulncheck exits 3). Findings in modules we require but never
+        # call are reported without failing. Called through an absolute path
+        # so the step does not depend on GOPATH/bin being on PATH.
+        #
+        # The scan covers the standard library too, so a red run can also
+        # mean "the runner's Go patch release is behind". The Go toolchain
+        # is pinned above; update it when a security fix requires a newer
+        # release.
+        run: $(go env GOPATH)/bin/govulncheck ./...

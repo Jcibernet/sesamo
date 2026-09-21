@@ -1,0 +1,32 @@
+# Binary
+/sesamo
+*.exe
+
+# Env
+.env*
+!.env.example
+
+# Postgres container data
+/.pgdata/
+
+# Go
+/vendor/
+
+# OS
+.DS_Store
+
+# Local tooling, notes, and runtime artifacts
+/.omp/
+/.factory/
+/.claude/
+/.codex/
+/AGENTS.md
+/CLAUDE.md
+/TODO.md
+*.dump
+*.log
+*.out
+*.pem
+*.key
+/cookies.txt
+/login.json
