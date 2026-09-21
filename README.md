@@ -1,25 +1,19 @@
 <p align="center">
-  <img src=".github/banner.svg" alt="Sésamo" width="100%">
-</p>
-
-<p align="center">
   <a href="https://github.com/Jcibernet/sesamo/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Jcibernet/sesamo/ci.yml?style=for-the-badge&labelColor=0d1117&color=56d364&label=CI" alt="ci"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/LICENSE-FSL--1.1-3fb950?style=for-the-badge&labelColor=0d1117" alt="license"></a>
   <img src="https://img.shields.io/badge/GO-%3E%3D1.26-2ea043?style=for-the-badge&labelColor=0d1117" alt="go">
-  <img src="https://img.shields.io/badge/INTROSPECT_P99-%3C20MS-d29922?style=for-the-badge&labelColor=0d1117" alt="latency">
-  <img src="docs/12-de-10.svg" alt="12 de 10">
 </p>
 
 # Sésamo
 
-A single-binary authentication server. Opaque Postgres-backed sessions,
-OAuth (Google / GitHub / Apple), email flows (magic-link, password reset,
-verification), an embedded themeable login UI, and a fast
-service-to-service introspection API.
+A single-binary authentication server with opaque Postgres-backed sessions,
+OAuth (Google / GitHub / Apple), email flows (magic link, password reset and
+verification), an embedded themeable login UI, and a service-to-service
+introspection API.
 
-No JWTs to verify, no JWKS to fetch, no client SDK to install. Your
-backend makes one HTTP call per request to check a session — **p50 under
-1ms, p99 ~4ms** including the Postgres lookup (see [Load test](#load-test)).
+No JWT verification, JWKS fetching or client SDK is required. The consuming
+backend sends the opaque session token to Sésamo for validation, keeping
+session state and revocation centralized.
 
 ```
 ┌──────────┐   sid cookie    ┌──────────┐   POST /v1/introspect   ┌──────────┐
@@ -33,46 +27,61 @@ backend makes one HTTP call per request to check a session — **p50 under
 
 ## Why opaque sessions instead of JWTs
 
-| | JWT / JWKS (Auth0-style) | Sésamo opaque sessions |
-|---|---|---|
-| Per-request cost | 10–50ms (JWKS fetch + RS256 verify) | <1ms (one indexed lookup) |
-| Instant revocation | No (token valid until expiry) | Yes (delete the row) |
-| Client SDK required | Usually | No — a `fetch` is enough |
-| Secret material in client | Public keys, token parsing | None |
+Opaque sessions keep validation and revocation in one place. A consuming
+backend calls `/v1/introspect` rather than parsing tokens or managing signing
+keys, and deleting a session invalidates it immediately. The tradeoff is that
+request authentication depends on Sésamo and Postgres being reachable, so
+deployments should account for that dependency in their availability design.
 
-## Quick start (clone to login in < 2 min)
+## Quick start
 
 ```bash
 # 1. Start the isolated dev Postgres (port 7432)
 docker compose up -d postgres
 cp .env.example .env            # defaults work for local dev
 
-# 2. Build the single static binary
+# 2. Build the server
 go build -o sesamo ./cmd/sesamo
 
 # 3. Migrate (idempotent) and serve (serve also auto-migrates)
-export $(grep -v '^#' .env | xargs)
+set -a; . ./.env; set +a
 ./sesamo migrate
 ./sesamo serve
 ```
 
-Open <http://localhost:7777/login>. With `SESAMO_EMAIL_PROVIDER=log` the
-magic-link / reset / verification links are printed to stdout, so you can
-complete every flow locally with no email provider configured.
+Open <http://localhost:7777/login>. With `SESAMO_EMAIL_PROVIDER=log`, magic
+link, reset and verification URLs are printed to stdout, so email-based flows
+work locally without configuring an email provider.
 
 ```bash
-# Create an account and log in (headless JSON mode)
-curl -s -XPOST -d 'email=me@example.com&password=supersecret1' \
+# In another terminal, load the local configuration, then create an account
+# and log in. Each POST uses the CSRF cookie and token returned together by
+# GET /login.
+set -a; . ./.env; set +a
+curl -sS -c cookies.txt -H 'Accept: application/json' \
+  'http://localhost:7777/login?mode=json' > login.json
+CSRF=$(python3 -c 'import json; print(json.load(open("login.json"))["csrf_token"])')
+curl -sS -c cookies.txt -b cookies.txt -H 'Accept: application/json' \
+  --data-urlencode 'email=me@example.com' \
+  --data-urlencode 'password=supersecret1' \
+  --data-urlencode "csrf_token=$CSRF" \
   http://localhost:7777/signup
-curl -s -XPOST -H 'Accept: application/json' \
-  -d 'email=me@example.com&password=supersecret1' \
-  http://localhost:7777/login -c cookies.txt
+
+curl -sS -c cookies.txt -b cookies.txt -H 'Accept: application/json' \
+  'http://localhost:7777/login?mode=json' > login.json
+CSRF=$(python3 -c 'import json; print(json.load(open("login.json"))["csrf_token"])')
+curl -sS -c cookies.txt -b cookies.txt -H 'Accept: application/json' \
+  --data-urlencode 'email=me@example.com' \
+  --data-urlencode 'password=supersecret1' \
+  --data-urlencode "csrf_token=$CSRF" \
+  http://localhost:7777/login
 
 # Introspect the session (what your backend does on every request)
-SID=$(grep sid cookies.txt | awk '{print $7}')
-curl -s -XPOST -H "Authorization: Bearer $SESAMO_SERVICE_TOKEN" \
-  -d "token=$SID" http://localhost:7777/v1/introspect
+SID=$(awk '$6 == "sid" { print $7 }' cookies.txt)
+curl -sS -XPOST -H "Authorization: Bearer $SESAMO_SERVICE_TOKEN" \
+  --data-urlencode "token=$SID" http://localhost:7777/v1/introspect
 # => {"active":true,"user_id":"019...","email":"me@example.com",...}
+rm login.json cookies.txt
 ```
 
 ## Endpoints
@@ -80,7 +89,7 @@ curl -s -XPOST -H "Authorization: Bearer $SESAMO_SERVICE_TOKEN" \
 ### End-user (browser)
 | Method | Path | Purpose |
 |---|---|---|
-| `GET`  | `/login` | Login page; JSON mode returns methods, branding and a one-use `csrf_token`. `?redirect_to=` captures the post-login destination: an internal path or an origin allowlisted in `SESAMO_REDIRECT_ORIGINS` |
+| `GET`  | `/login` | Login page; JSON mode returns methods, branding and a short-lived `csrf_token` while setting its matching HttpOnly cookie. `?redirect_to=` captures the post-login destination: an internal path or an origin allowlisted in `SESAMO_REDIRECT_ORIGINS` |
 | `POST` | `/login` | Email + password login; requires the CSRF pair and returns to the captured/`redirect_to` destination |
 | `POST` | `/signup` | Create account, send verification email; requires CSRF (`SESAMO_SIGNUP=disabled` refuses with a stable 403 after CSRF validation) |
 | `POST` | `/logout` | Revoke session; requires CSRF. Optional `redirect_to` form field uses the same allowlist |
@@ -132,7 +141,7 @@ Minimal, SDK-free integrations live in [`examples/`](./examples):
 - [`fastapi_dependency.py`](./examples/fastapi_dependency.py) — a FastAPI
   `Depends(current_user)` dependency.
 
-Both are ~30 lines and use nothing but the standard HTTP client.
+Both use only their language's standard HTTP client.
 
 ### Identity boundary
 
@@ -238,12 +247,11 @@ NDJSON, then:
 ```
 
 Bcrypt password hashes are stored **verbatim**, so every user's existing
-password keeps working immediately — no reset emails, no big-bang cutover.
-On each user's first successful login the hash is transparently re-hashed
+password keeps working immediately — no reset emails or big-bang cutover.
+On each user's first successful login, the hash is transparently re-hashed
 from bcrypt to Argon2id (lazy migration). Rows are inserted in pipelined
-batches of 500 (one round trip per batch), so a bulk import stays fast
-even against a remote Postgres. Re-running the import is idempotent:
-existing emails are skipped — a skip does **not** update other fields
+batches of 500 (one round trip per batch). Re-running the import is idempotent:
+existing emails are skipped, and a skip does **not** update other fields
 (name, `email_verified`) that may have changed in Auth0 since.
 
 ## Security model
@@ -273,21 +281,8 @@ existing emails are skipped — a skip does **not** update other fields
 - **Failure bounds**: server read/write/idle deadlines, bounded OAuth/JWKS/
   email clients, panic recovery and request correlation IDs.
 
-24 threat-model integration tests cover these (`go test ./internal/http/
--run Threat`).
-
-## Load test
-
-The introspect hot path is the number that matters. The included load
-test drives 3,200 concurrent introspections over loopback HTTP against a
-real Postgres session:
-
-```
-$ go test ./internal/http -run TestLoadIntrospect -v
-introspect load: n=3200 rps=16051 p50=794µs p95=1.708ms p99=4.011ms
-```
-
-SLO: **p50 < 5ms, p99 < 20ms** — met with large margin.
+The threat model and its corresponding tests are documented in
+[`THREAT_MODEL.md`](./THREAT_MODEL.md).
 
 ## Testing
 
@@ -311,11 +306,11 @@ CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=$VERSION" -o se
 ./sesamo version
 ```
 
-Produces a single static binary (~16 MB). It needs only a reachable
-Postgres. `./sesamo serve` runs migrations on boot, so a rolling deploy is
-safe (migrations take a Postgres advisory lock to serialize concurrent
-starts). The server bounds headers (10 s), full reads/writes (30 s) and idle
-connections (120 s). Health: `/healthz` (liveness), `/readyz` (readiness).
+This produces a single static binary that needs a reachable Postgres.
+`./sesamo serve` runs migrations on boot; a Postgres advisory lock serializes
+concurrent migration attempts. The server bounds headers (10 s), full
+reads/writes (30 s) and idle connections (120 s). Health: `/healthz`
+(liveness), `/readyz` (readiness).
 
 Release tags `v*` run the tag workflow: cross-compiled binary assets with
 checksums, a multi-arch GHCR image whose digest is emitted in the summary,

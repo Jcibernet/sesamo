@@ -198,6 +198,7 @@ func buildDescriptor(cfg *config.Config, oauthProviders []string) descriptorDoc 
 			MagicLinkConfirm:    descriptorEndpoint{Method: "GET", Path: "/magiclink/confirm"},
 			ResendWebhook:       descriptorEndpoint{Method: "POST", Path: "/v1/webhooks/resend", Auth: authSvixSignature},
 			Introspect:          descriptorEndpoint{Method: "POST", Path: "/v1/introspect", Auth: authServiceToken},
+			RevokeSession:       descriptorEndpoint{Method: "POST", Path: "/v1/sessions/revoke", Auth: authServiceToken},
 			AdminUser:           descriptorEndpoint{Method: "GET", Path: "/v1/admin/users/{id}", Auth: authAdminKey},
 			AdminRevokeSessions: descriptorEndpoint{Method: "POST", Path: "/v1/admin/users/{id}/revoke-sessions", Auth: authAdminKey},
 			AdminDisable:        descriptorEndpoint{Method: "POST", Path: "/v1/admin/users/{id}/disable", Auth: authAdminKey},

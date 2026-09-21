@@ -245,7 +245,7 @@ func TestFlow06_LoginPageMagicLinkWiringAndCSP(t *testing.T) {
 }
 
 // newRedirectHarness boots the server with a consuming app allowlisted,
-// mirroring the Acme deployment (SPA on another local origin).
+// mirroring an SPA on another local origin.
 func newRedirectHarness(t *testing.T) *harness {
 	return newHarnessWithConfig(t, func(cfg *config.Config) {
 		cfg.RedirectOrigins = []string{"http://127.0.0.1:8010"}

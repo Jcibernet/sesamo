@@ -1,9 +1,0 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="150" height="28" viewBox="0 0 150 28" role="img" aria-label="Sésamo: 12 de 10">
-  <title>Sésamo: 12 de 10</title>
-  <rect width="150" height="28" rx="4" fill="#0d1117"/>
-  <rect x="1" y="1" width="148" height="26" rx="3" fill="none" stroke="#1f6f35" stroke-width="1"/>
-  <text x="75" y="19" text-anchor="middle" xml:space="preserve"
-        font-family="ui-monospace, 'Cascadia Mono', 'DejaVu Sans Mono', Menlo, Consolas, monospace"
-        font-size="13" fill="#d29922">[ ★ 12 DE 10 ]</text>
-</svg>

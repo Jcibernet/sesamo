@@ -116,19 +116,6 @@ transferred; nothing avoided by dropping features.
 
 ## 4. Did we do a good job?
 
-Validation is executable: every mitigation row above names a test in
-`internal/http/threat_test.go` or a store-level test. `go test ./...`
-runs all of them; the suite is hermetic (re-runs are clean). The load
-test pins the hot-path SLO (p50 < 5 ms, p99 < 20 ms). Re-ask the four
-questions whenever a route, header, or table is added — and when V2/OIDC
-is ever unfrozen, model it BEFORE building it.
-
-## Auth0-parity notes (V1 scope)
-
-Covered: brute-force protection (Auth0 "attack protection"), audit trail
-(Auth0 "logs"), anti-enumeration, session revocation, import path.
-Known deltas, deliberate for V1: no anomaly/breached-password detection
-(would need an external corpus — candidate: HIBP k-anonymity range API,
-env-gated, stdlib-only), no MFA/WebAuthn (V2 candidate), no log
-streaming (the `audit_log` table + Prometheus `/metrics` are the
-integration points).
+Validation is executable: mitigation rows above name their corresponding
+integration or store-level tests. Revisit the four questions whenever a route,
+header, table, or external trust boundary changes.

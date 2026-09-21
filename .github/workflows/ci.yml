@@ -112,7 +112,7 @@ jobs:
         # so the step does not depend on GOPATH/bin being on PATH.
         #
         # The scan covers the standard library too, so a red run can also
-        # mean "the runner's Go patch release is behind". `go-version: "1.26"`
-        # above floats to the newest 1.26.x, so that fixes itself; a pinned
-        # patch would need bumping here.
+        # mean "the runner's Go patch release is behind". The Go toolchain
+        # is pinned above; update it when a security fix requires a newer
+        # release.
         run: $(go env GOPATH)/bin/govulncheck ./...

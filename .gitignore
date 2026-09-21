@@ -3,7 +3,7 @@
 *.exe
 
 # Env
-.env
+.env*
 !.env.example
 
 # Postgres container data
@@ -15,8 +15,18 @@
 # OS
 .DS_Store
 
-# internal working notes — never published (remote release excluded them)
-AGENTS.md
-TODO.md
-*.excalidraw
-/docs/26-08-27/production-readiness.md
+# Local tooling, notes, and runtime artifacts
+/.omp/
+/.factory/
+/.claude/
+/.codex/
+/AGENTS.md
+/CLAUDE.md
+/TODO.md
+*.dump
+*.log
+*.out
+*.pem
+*.key
+/cookies.txt
+/login.json

@@ -4,3 +4,15 @@
 docs/
 *.md
 docker-compose.yml
+.omp
+.factory
+.claude
+.codex
+sesamo
+*.dump
+*.log
+*.out
+*.pem
+*.key
+cookies.txt
+login.json
